@@ -165,6 +165,15 @@ def run_backtest_only():
     engine = BacktestEngine()
     result = engine.run(df)
     engine.print_summary(result)
+
+    # Save trades
+    output_dir = Path("outputs")
+    output_dir.mkdir(exist_ok=True)
+    trades_df = pd.DataFrame(result.trades)
+    if not trades_df.empty:
+        trades_df.to_csv(output_dir / "backtest_trades.csv", index=False)
+    result.daily_pnl.to_csv(output_dir / "daily_pnl.csv")
+    result.cumulative_pnl.to_csv(output_dir / "cumulative_pnl.csv")
     
     return df, result
 

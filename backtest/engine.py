@@ -158,6 +158,15 @@ class BacktestEngine:
     
     def _try_entry(self, row: pd.Series, date_str: str):
         """Attempt to open a new position if capacity allows."""
+        # Cooldown: don't re-enter within N days of a losing exit
+        if self.closed_positions:
+            last_closed = self.closed_positions[-1]
+            if last_closed.current_pnl < 0:
+                last_exit = datetime.strptime(last_closed.exit_date, "%Y-%m-%d")
+                current = datetime.strptime(date_str, "%Y-%m-%d")
+                if (current - last_exit).days < self.config.cooldown_after_loss_days:
+                    return
+
         if len(self.positions) >= self.config.max_concurrent_positions:
             return
         

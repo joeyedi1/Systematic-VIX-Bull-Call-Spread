@@ -130,8 +130,11 @@ class BacktestConfig:
     
     # Position sizing
     max_position_pct: float = 0.02          # Max 2% of portfolio per spread
-    max_concurrent_positions: int = 3       # Max 3 open spreads at once
+    # max_concurrent_positions: int = 3       # Max 3 open spreads at once
+    max_concurrent_positions: int = 2       # Was 3 — reduces correlated drawdowns
     
+    cooldown_after_loss_days: int = 10      # Don't re-enter for 10 days after a losing exit
+
     # Settlement
     use_vro_settlement: bool = True         # Use VRO when available, else VIX futures proxy
     vro_uncertainty_band: float = 0.50      # ±$0.50 for stress testing narrow spreads
@@ -201,7 +204,8 @@ class SignalConfig:
     })
     
     # Entry threshold
-    entry_score_threshold: float = 0.65     # Composite score > 0.65 → consider entry
+    # entry_score_threshold: float = 0.65     # Composite score > 0.65 → consider entry
+    entry_score_threshold: float = 0.70     # Was 0.65 — filters out weaker setups
     
     # Individual indicator thresholds
     term_structure_contango_threshold: float = 0.92   # VIX/VIX3M < 0.92 = strong contango

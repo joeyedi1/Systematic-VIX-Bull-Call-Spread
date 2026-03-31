@@ -125,6 +125,7 @@ class BacktestEngine:
         logger.info("=" * 60)
         
         daily_pnl = pd.Series(0.0, index=df.index, name="Daily_PnL")
+        prev_portfolio_value = 0.0
         
         for i, (date, row) in enumerate(df.iterrows()):
             date_str = date.strftime("%Y-%m-%d")
@@ -139,8 +140,13 @@ class BacktestEngine:
             if row.get("Signal_Entry", False):
                 self._try_entry(row, date_str)
             
-            # 4. Record daily P&L
-            daily_pnl.loc[date] = self._get_daily_pnl()
+            # 4. Record daily P&L (change in total portfolio value)
+            # Portfolio value = unrealized P&L on open + cumulative realized P&L
+            unrealized = sum(p.current_pnl for p in self.positions if p.is_open)
+            realized = sum(p.current_pnl for p in self.closed_positions)
+            portfolio_value = unrealized + realized
+            daily_pnl.loc[date] = portfolio_value - prev_portfolio_value
+            prev_portfolio_value = portfolio_value
         
         # Force-close any remaining open positions
         self._close_all_remaining(df.iloc[-1], df.index[-1].strftime("%Y-%m-%d"))
@@ -381,10 +387,10 @@ class BacktestEngine:
             dd = cum - peak
             result.max_drawdown = dd.min()
             
-            # Sharpe (annualized, assuming daily returns)
-            daily_returns = daily_pnl.diff().dropna()
-            if daily_returns.std() > 0:
-                result.sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252)
+            # Sharpe (annualized, daily P&L is already in change form)
+            active_pnl = daily_pnl[daily_pnl != 0]
+            if len(active_pnl) > 1 and active_pnl.std() > 0:
+                result.sharpe_ratio = active_pnl.mean() / active_pnl.std() * np.sqrt(252)
         
         return result
     

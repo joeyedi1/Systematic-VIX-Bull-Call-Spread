@@ -104,9 +104,10 @@ class RegimeClassifier:
         df["Regime_Prob_HighVol"] = np.nan
         df["Regime_Raw"] = np.nan  # Before debouncing
         
-        train_window = self.config.training_window_days
-        refit_freq = self.config.refit_frequency_days
-        min_train = self.config.min_training_days
+        from config.settings import BACKTEST
+        train_window = BACKTEST.training_window_days
+        refit_freq = BACKTEST.refit_frequency_days
+        min_train = BACKTEST.min_training_days
         
         if n < min_train:
             logger.warning(f"Not enough data ({n} rows) for minimum training ({min_train}). Returning NaN regimes.")

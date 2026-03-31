@@ -2,21 +2,11 @@
 data/cot_fetcher.py
 ===================
 CFTC Commitments of Traders data for VIX futures.
-Uses free public CSV downloads — no Bloomberg or paid data required.
-
-The TFF (Traders in Financial Futures) report breaks positioning into:
-  - Dealer/Intermediary
-  - Asset Manager/Institutional  ← Primary signal
-  - Leveraged Funds             ← Secondary signal
-  - Other Reportables
-
-Published weekly: positions as of Tuesday, released Friday 3:30 PM ET.
+Uses the cot_reports library which handles CFTC's changing URLs automatically.
 """
 
 import pandas as pd
 import numpy as np
-import io
-import zipfile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -24,217 +14,194 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Try requests for downloads
 try:
-    import requests
-    REQUESTS_AVAILABLE = True
+    import cot_reports as cot
+    COT_LIBRARY_AVAILABLE = True
 except ImportError:
-    REQUESTS_AVAILABLE = False
-
-from config.settings import CFTC_VIX_CODE, CFTC_DATA_URL, CFTC_HISTORY_URL
+    COT_LIBRARY_AVAILABLE = False
+    logger.warning("cot_reports not installed. pip install cot_reports")
 
 
 class COTFetcher:
-    """
-    Fetch and process CFTC Commitments of Traders data for VIX futures.
-    
-    Output columns:
-        - AM_Long, AM_Short, AM_Net     (Asset Manager)
-        - LF_Long, LF_Short, LF_Net     (Leveraged Funds)
-        - Dealer_Long, Dealer_Short, Dealer_Net
-        - Total_OI                        (Total Open Interest)
-        - AM_Net_OI_Pct                  (AM Net as % of OI)
-        - LF_Net_OI_Pct                  (LF Net as % of OI)
-    """
-    
     CACHE_DIR = Path("outputs/cache")
-    VIX_CFTC_CODE = "1170E1"   # CBOE VIX Futures code in TFF report
-    
+    VIX_MARKET_NAMES = ["VIX", "CBOE VIX", "CBOE VOLATILITY INDEX"]
+
     def __init__(self):
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     def fetch_all(
         self,
         start_year: int = 2022,
         end_year: int = None,
         cache_file: str = "cot_vix_data.parquet",
     ) -> pd.DataFrame:
-        """
-        Fetch COT data from CFTC public archives + current year.
-        
-        Returns:
-            Weekly DataFrame with positioning data, DatetimeIndex (Tuesdays)
-        """
         if not end_year:
             end_year = datetime.now().year
-        
+
         cache_path = self.CACHE_DIR / cache_file
-        
-        # Check cache
+
         if cache_path.exists():
             df = pd.read_parquet(cache_path)
             last_date = df.index.max()
             if (pd.Timestamp.now() - last_date).days < 7:
                 logger.info(f"COT cache fresh (last: {last_date.date()})")
                 return df
-        
-        if not REQUESTS_AVAILABLE:
+
+        if not COT_LIBRARY_AVAILABLE:
             if cache_path.exists():
-                logger.warning("requests not installed. Using cached COT data.")
                 return pd.read_parquet(cache_path)
-            raise RuntimeError("requests package required for COT download. pip install requests")
-        
+            raise RuntimeError("pip install cot_reports")
+
         all_dfs = []
-        
-        # Fetch historical years
-        for year in range(start_year, end_year):
-            logger.info(f"Fetching COT data for {year}...")
-            df = self._fetch_year(year)
-            if df is not None and not df.empty:
-                all_dfs.append(df)
-        
-        # Fetch current year (uses different URL)
-        logger.info(f"Fetching COT data for {end_year} (current)...")
-        df_current = self._fetch_current()
-        if df_current is not None and not df_current.empty:
-            all_dfs.append(df_current)
-        
+
+        # Historical bulk (up to 2016)
+        logger.info("Fetching COT historical bulk...")
+        try:
+            hist_df = cot.cot_hist(cot_report_type="traders_in_financial_futures_fut")
+            if hist_df is not None and not hist_df.empty:
+                processed = self._process_cot_df(hist_df)
+                if processed is not None and not processed.empty:
+                    all_dfs.append(processed)
+                    logger.info(f"  Historical: {len(processed)} weeks")
+        except Exception as e:
+            logger.warning(f"  Historical fetch failed: {e}")
+
+        # Recent years (2017+)
+        for year in range(max(start_year, 2017), end_year + 1):
+            logger.info(f"Fetching COT {year}...")
+            try:
+                year_df = cot.cot_year(
+                    year=year,
+                    cot_report_type="traders_in_financial_futures_fut",
+                )
+                if year_df is not None and not year_df.empty:
+                    processed = self._process_cot_df(year_df)
+                    if processed is not None and not processed.empty:
+                        all_dfs.append(processed)
+                        logger.info(f"  {year}: {len(processed)} weeks")
+            except Exception as e:
+                logger.warning(f"  {year} failed: {e}")
+
         if not all_dfs:
             raise RuntimeError("No COT data fetched from any source")
-        
+
         result = pd.concat(all_dfs).sort_index()
         result = result[~result.index.duplicated(keep="last")]
-        
-        # Cache
+        result = result[result.index >= pd.Timestamp(f"{start_year}-01-01")]
+
         result.to_parquet(cache_path)
-        logger.info(f"COT data cached: {len(result)} weeks, {result.index.min().date()} to {result.index.max().date()}")
-        
+        logger.info(f"COT cached: {len(result)} weeks, {result.index.min().date()} to {result.index.max().date()}")
         return result
-    
-    def _fetch_year(self, year: int) -> Optional[pd.DataFrame]:
-        """Fetch historical year from CFTC zip archive."""
-        url = CFTC_HISTORY_URL.format(year=year)
-        try:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-                # Find the TFF file in the archive
-                csv_names = [n for n in z.namelist() if n.endswith(".txt") or n.endswith(".csv")]
-                if not csv_names:
-                    logger.warning(f"No CSV found in {url}")
-                    return None
-                
-                with z.open(csv_names[0]) as f:
-                    df = pd.read_csv(f)
-            
-            return self._process_tff(df)
-            
-        except Exception as e:
-            logger.warning(f"Failed to fetch COT for {year}: {e}")
+
+    def _process_cot_df(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if df is None or df.empty:
             return None
-    
-    def _fetch_current(self) -> Optional[pd.DataFrame]:
-        """Fetch current year TFF report."""
-        try:
-            resp = requests.get(CFTC_DATA_URL, timeout=30)
-            resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text))
-            return self._process_tff(df)
-        except Exception as e:
-            logger.warning(f"Failed to fetch current COT: {e}")
-            return None
-    
-    def _process_tff(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract VIX futures positioning from raw TFF report.
-        
-        The TFF columns we need:
-        - "Asset Mgr Positions-Long (All)" / "Asset Mgr Positions-Short (All)"
-        - "Lev Money Positions-Long (All)" / "Lev Money Positions-Short (All)"  
-        - "Dealer Positions-Long (All)" / "Dealer Positions-Short (All)"
-        - "Open Interest (All)"
-        """
-        # Filter to VIX futures only
-        # The CFTC code column varies by file format
-        code_cols = ["CFTC_Contract_Market_Code", "CFTC Contract Market Code"]
-        code_col = None
-        for c in code_cols:
-            if c in df.columns:
-                code_col = c
+
+        # Find market name column
+        name_col = None
+        for c in df.columns:
+            sample = df[c].astype(str).head(20)
+            if any("VIX" in str(v).upper() for v in sample):
+                name_col = c
                 break
-        
-        if code_col is None:
-            # Try filtering by name
-            name_cols = ["Market_and_Exchange_Names", "Market and Exchange Names"]
-            for c in name_cols:
+
+        if name_col is None:
+            # Try common column names
+            for c in ["Market and Exchange Names", "Market_and_Exchange_Names"]:
                 if c in df.columns:
-                    df = df[df[c].str.contains("VIX", case=False, na=False)]
+                    name_col = c
                     break
-        else:
-            df = df[df[code_col].astype(str).str.strip() == self.VIX_CFTC_CODE]
-        
-        if df.empty:
-            return pd.DataFrame()
-        
-        # Parse report date
-        date_cols = ["Report_Date_as_YYYY-MM-DD", "As of Date in Form YYYY-MM-DD"]
+
+        if name_col is None:
+            logger.warning(f"No market name column found. Cols: {df.columns.tolist()[:10]}")
+            return None
+
+        # Filter to VIX
+        vix_mask = df[name_col].astype(str).str.upper().str.contains(
+            "|".join(self.VIX_MARKET_NAMES), na=False
+        )
+        vix_df = df[vix_mask].copy()
+
+        if vix_df.empty:
+            return None
+
+        # Find date column
         date_col = None
-        for c in date_cols:
-            if c in df.columns:
+        for c in ["As of Date in Form YYYY-MM-DD", "Report_Date_as_YYYY-MM-DD",
+                   "As_of_Date_In_Form_YYMMDD"]:
+            if c in vix_df.columns:
                 date_col = c
                 break
-        
+
         if date_col is None:
-            logger.warning("Could not find date column in COT data")
-            return pd.DataFrame()
-        
-        # Build output
+            # Try any column with dates
+            for c in vix_df.columns:
+                if "date" in c.lower():
+                    date_col = c
+                    break
+
+        if date_col is None:
+            logger.warning("No date column found")
+            return None
+
         result = pd.DataFrame()
-        result.index = pd.to_datetime(df[date_col].values)
+        result.index = pd.to_datetime(vix_df[date_col].values)
         result.index.name = "Date"
-        
-        # Asset Manager positioning
-        am_long_cols = [c for c in df.columns if "asset" in c.lower() and "long" in c.lower() and "all" in c.lower()]
-        am_short_cols = [c for c in df.columns if "asset" in c.lower() and "short" in c.lower() and "all" in c.lower()]
-        
-        if am_long_cols and am_short_cols:
-            result["AM_Long"] = df[am_long_cols[0]].values
-            result["AM_Short"] = df[am_short_cols[0]].values
+
+        # Asset Manager
+        am_long = self._find_col(vix_df, ["asset", "mgr"], ["long"], ["spread", "change"])
+        if not am_long:
+            am_long = self._find_col(vix_df, ["asset", "inst"], ["long"], ["spread", "change"])
+        am_short = self._find_col(vix_df, ["asset", "mgr"], ["short"], ["spread", "change"])
+        if not am_short:
+            am_short = self._find_col(vix_df, ["asset", "inst"], ["short"], ["spread", "change"])
+
+        if am_long and am_short:
+            result["AM_Long"] = pd.to_numeric(vix_df[am_long].values, errors="coerce")
+            result["AM_Short"] = pd.to_numeric(vix_df[am_short].values, errors="coerce")
             result["AM_Net"] = result["AM_Long"] - result["AM_Short"]
-        
+
         # Leveraged Funds
-        lf_long_cols = [c for c in df.columns if "lev" in c.lower() and "long" in c.lower() and "all" in c.lower()]
-        lf_short_cols = [c for c in df.columns if "lev" in c.lower() and "short" in c.lower() and "all" in c.lower()]
-        
-        if lf_long_cols and lf_short_cols:
-            result["LF_Long"] = df[lf_long_cols[0]].values
-            result["LF_Short"] = df[lf_short_cols[0]].values
+        lf_long = self._find_col(vix_df, ["lev"], ["long"], ["spread", "change"])
+        lf_short = self._find_col(vix_df, ["lev"], ["short"], ["spread", "change"])
+
+        if lf_long and lf_short:
+            result["LF_Long"] = pd.to_numeric(vix_df[lf_long].values, errors="coerce")
+            result["LF_Short"] = pd.to_numeric(vix_df[lf_short].values, errors="coerce")
             result["LF_Net"] = result["LF_Long"] - result["LF_Short"]
-        
+
         # Dealer
-        dealer_long_cols = [c for c in df.columns if "dealer" in c.lower() and "long" in c.lower() and "all" in c.lower()]
-        dealer_short_cols = [c for c in df.columns if "dealer" in c.lower() and "short" in c.lower() and "all" in c.lower()]
-        
-        if dealer_long_cols and dealer_short_cols:
-            result["Dealer_Long"] = df[dealer_long_cols[0]].values
-            result["Dealer_Short"] = df[dealer_short_cols[0]].values
+        dealer_long = self._find_col(vix_df, ["dealer"], ["long"], ["spread", "change"])
+        dealer_short = self._find_col(vix_df, ["dealer"], ["short"], ["spread", "change"])
+
+        if dealer_long and dealer_short:
+            result["Dealer_Long"] = pd.to_numeric(vix_df[dealer_long].values, errors="coerce")
+            result["Dealer_Short"] = pd.to_numeric(vix_df[dealer_short].values, errors="coerce")
             result["Dealer_Net"] = result["Dealer_Long"] - result["Dealer_Short"]
-        
-        # Total Open Interest
-        oi_cols = [c for c in df.columns if "open" in c.lower() and "interest" in c.lower() and "all" in c.lower()]
-        if oi_cols:
-            result["Total_OI"] = df[oi_cols[0]].values
-            
-            # Normalize by OI
+
+        # Open Interest
+        oi_col = self._find_col(vix_df, ["open", "interest"], ["all"], ["change", "old", "other"])
+        if not oi_col:
+            oi_col = self._find_col(vix_df, ["open", "interest"], [], ["change", "old", "other", "pct"])
+
+        if oi_col:
+            result["Total_OI"] = pd.to_numeric(vix_df[oi_col].values, errors="coerce")
             if "AM_Net" in result.columns:
                 result["AM_Net_OI_Pct"] = result["AM_Net"] / result["Total_OI"] * 100
             if "LF_Net" in result.columns:
                 result["LF_Net_OI_Pct"] = result["LF_Net"] / result["Total_OI"] * 100
-        
-        # Convert to numeric
-        for col in result.columns:
-            result[col] = pd.to_numeric(result[col], errors="coerce")
-        
-        result = result.sort_index()
-        return result
+
+        return result.sort_index()
+
+    @staticmethod
+    def _find_col(df, must_contain, also_contain, must_not_contain):
+        for col in df.columns:
+            col_lower = col.lower().replace("_", " ")
+            if not all(kw.lower() in col_lower for kw in must_contain):
+                continue
+            if also_contain and not any(kw.lower() in col_lower for kw in also_contain):
+                continue
+            if any(kw.lower() in col_lower for kw in must_not_contain):
+                continue
+            return col
+        return None

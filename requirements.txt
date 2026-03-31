@@ -9,6 +9,9 @@ hmmlearn>=0.3.0
 # Bloomberg API (install separately via Bloomberg SDK)
 # blpapi  # Not on PyPI — install from Bloomberg: pip install --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi
 
+# cot
+cot_reports>=0.1.3
+
 # Data fetching
 requests>=2.28
 

@@ -195,10 +195,17 @@ def add_vrp_features(df: pd.DataFrame, config: object = FEATURE) -> pd.DataFrame
     spx = df["SPX_Close"]
     vix = df["VIX_Spot"]
     
-    # 1. Realized volatility of SPX (21-day, annualized)
+    # 1. Realized volatility of SPX (EMA-weighted, annualized)
+    # EMA weights recent days more heavily, reducing lag during sudden shocks
+    # This addresses the VRP lag problem: when VIX spikes instantly but 
+    # backward-looking RV is still low, EMA catches up faster than SMA
     spx_returns = np.log(spx / spx.shift(1))
     rv_window = config.realized_vol_window
-    df["SPX_RealizedVol_21d"] = spx_returns.rolling(rv_window, min_periods=10).std() * np.sqrt(252) * 100
+    
+    # EMA of squared returns, then annualize
+    squared_returns = spx_returns ** 2
+    ema_var = squared_returns.ewm(span=rv_window, min_periods=10).mean()
+    df["SPX_RealizedVol_21d"] = np.sqrt(ema_var * 252) * 100
     
     # 2. VRP = VIX - Realized Vol (simple, in vol points)
     df["VRP_Simple"] = vix - df["SPX_RealizedVol_21d"]

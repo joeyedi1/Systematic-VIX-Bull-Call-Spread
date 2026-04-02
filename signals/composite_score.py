@@ -92,14 +92,25 @@ class CompositeSignal:
         if total_weight > 0:
             df["Signal_Score"] /= total_weight
         
-        # 3. Generate entry decisions (regime-gated)
+        # 3. Generate entry decisions (regime-gated, regime-dependent thresholds)
         df["Signal_Entry"] = False
-        entry_mask = (
+        
+        # LOW_VOL: standard threshold
+        low_vol_mask = (
             (df["Signal_Score"] >= self.config.entry_score_threshold) &
-            (df["Regime"].isin([VolRegime.LOW_VOL, VolRegime.TRANSITION])) &
+            (df["Regime"] == VolRegime.LOW_VOL) &
             (df["Signal_Score"].notna())
         )
-        df.loc[entry_mask, "Signal_Entry"] = True
+        df.loc[low_vol_mask, "Signal_Entry"] = True
+        
+        # TRANSITION: higher bar required
+        transition_threshold = getattr(self.config, 'transition_score_threshold', 0.80)
+        transition_mask = (
+            (df["Signal_Score"] >= transition_threshold) &
+            (df["Regime"] == VolRegime.TRANSITION) &
+            (df["Signal_Score"].notna())
+        )
+        df.loc[transition_mask, "Signal_Entry"] = True
         
         logger.info(f"Entry signals: {df['Signal_Entry'].sum()} days out of {len(df)}")
         
@@ -267,10 +278,11 @@ class ExitSignalGenerator:
         if dte <= self.config.time_stop_dte and current_pnl <= 0:
             return SignalDecision.EXIT_TIME_STOP
         
-        # 4. Regime change exit: if moved to high vol and profitable
+        # 4. Regime change exit: exit UNCONDITIONALLY if HIGH_VOL detected
+        # Holding losing long-premium in a mean-reverting high-vol environment
+        # is fighting gravity — VIX at 30+ is more likely to fall than spike further
         if (self.config.regime_exit and 
-            current_regime == VolRegime.HIGH_VOL and
-            current_pnl > 0):
+            current_regime == VolRegime.HIGH_VOL):
             return SignalDecision.EXIT_REGIME_CHANGE
         
         # 5. Stop loss: close if spread has lost 70% of entry value

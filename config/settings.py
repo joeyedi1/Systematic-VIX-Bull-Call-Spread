@@ -196,16 +196,16 @@ class SignalConfig:
     
     # Signal weights (must sum to 1.0)
     weights: Dict[str, float] = field(default_factory=lambda: {
-        "term_structure": 0.30,     # VIX/VIX3M ratio → steep contango = bullish
-        "vix_percentile": 0.20,     # VIX level vs 1yr percentile → low = bullish
-        "vvix_level": 0.20,         # VVIX → low = cheap options
-        "cot_positioning": 0.15,    # COT net short → extreme = bullish contrarian
-        "vrp_signal": 0.15,         # Variance risk premium → large = headwind
+        "term_structure": 0.25,     # Was 0.30 — reduced to avoid double-counting with HMM
+        "vix_percentile": 0.20,     
+        "vvix_level": 0.25,         # Was 0.20 — increased, strongest independent signal
+        "cot_positioning": 0.05,    # Was 0.15 — weekly lagged data, reduced to backdrop
+        "vrp_signal": 0.25,         # Was 0.15 — increased to balance
     })
     
-    # Entry threshold
-    # entry_score_threshold: float = 0.65     # Composite score > 0.65 → consider entry
-    entry_score_threshold: float = 0.70     # Was 0.65 — filters out weaker setups
+    # Entry thresholds — regime-dependent
+    entry_score_threshold: float = 0.70          # LOW_VOL entry threshold
+    transition_score_threshold: float = 999.0    # Effectively disabled — LOW_VOL only
     
     # Individual indicator thresholds
     term_structure_contango_threshold: float = 0.92   # VIX/VIX3M < 0.92 = strong contango

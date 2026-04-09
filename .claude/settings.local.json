@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python test/full_rerun.py)"
+      "Bash(python test/full_rerun.py)",
+      "Bash(python -c ':*)"
     ]
   }
 }

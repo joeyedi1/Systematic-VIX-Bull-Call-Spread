@@ -160,10 +160,12 @@ class RegimeClassifier:
             
             predict_start = predict_end
         
-        # Apply debouncing
-        df["Regime"] = self._debounce_regimes(
+        # Apply causal confirmation filter (replaces hindsight debounce)
+        df["Regime"] = self._confirm_regimes(
             df["Regime_Raw"].values,
-            min_holding=self.config.min_regime_holding_days,
+            df[["Regime_Prob_LowVol", "Regime_Prob_Transition", "Regime_Prob_HighVol"]].values,
+            prob_threshold=self.config.regime_transition_prob_threshold,
+            n_days=self.config.min_regime_holding_days,
         )
         
         logger.info(f"Walk-forward complete: {refit_count} refits, {n - min_train} predictions")
@@ -216,14 +218,29 @@ class RegimeClassifier:
     
     def _predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Predict states and posterior probabilities.
-        
+        Forward-only filtered state probabilities.
+
+        Returns P(state_t | obs_1:t) — uses NO future observations.
+        hmmlearn's predict() (Viterbi) and predict_proba() (forward-backward)
+        both use the full sequence; we need the raw forward lattice instead.
+
         Returns:
-            states: (n_samples,) array of state indices
-            posteriors: (n_samples, n_states) array of posterior probabilities
+            states: (n_samples,) array of MAP state indices per day
+            posteriors: (n_samples, n_states) filtered probability matrix
         """
-        states = self.model.predict(X)
-        posteriors = self.model.predict_proba(X)
+        from hmmlearn import _hmmc
+
+        log_frameprob = self.model._compute_log_likelihood(X)
+        _, fwdlattice = _hmmc.forward_log(
+            self.model.startprob_, self.model.transmat_, log_frameprob,
+        )
+        # fwdlattice is log P(obs_1:t, state_t) — normalize each row to get
+        # P(state_t | obs_1:t)
+        log_posteriors = fwdlattice - np.logaddexp.reduce(
+            fwdlattice, axis=1, keepdims=True,
+        )
+        posteriors = np.exp(log_posteriors)
+        states = posteriors.argmax(axis=1)
         return states, posteriors
     
     def _map_labels(self, states: np.ndarray, X_train: np.ndarray) -> np.ndarray:
@@ -269,75 +286,91 @@ class RegimeClassifier:
         return reverse_map.get(regime, int(regime))
     
     @staticmethod
-    def _debounce_regimes(
+    def _confirm_regimes(
         raw_regimes: np.ndarray,
-        min_holding: int = 3,
+        probs: np.ndarray,
+        prob_threshold: float = 0.70,
+        n_days: int = 3,
     ) -> np.ndarray:
         """
-        Debounce regime transitions to avoid whipsaw.
-        
-        If a regime change lasts fewer than `min_holding` days, 
-        revert to the previous regime.
-        
-        Based on Nystrup et al. (2020) finding that real-time HMMs
-        produce ~2x as many switches as in-sample.
+        Causal regime confirmation — no future data used.
+
+        A regime transition is confirmed only when the filtered probability
+        for the new MAP state exceeds *prob_threshold* for *n_days*
+        consecutive days. Until confirmed, the previous regime persists.
+
+        This replaces the old debounce which scanned forward to measure
+        run length (look-ahead).
         """
-        result = raw_regimes.copy()
-        n = len(result)
-        
+        n = len(raw_regimes)
+        result = np.full(n, np.nan)
+
         if n == 0:
             return result
-        
-        # Find regime change points
-        i = 0
-        while i < n:
-            if np.isnan(result[i]):
-                i += 1
+
+        # Bootstrap: first non-NaN raw regime becomes the active regime
+        active_regime = np.nan
+        streak = 0
+
+        for t in range(n):
+            if np.isnan(raw_regimes[t]):
+                result[t] = np.nan
                 continue
-            
-            # Find the end of this regime run
-            j = i + 1
-            while j < n and (result[j] == result[i] or np.isnan(result[j])):
-                j += 1
-            
-            # If this run is too short, revert to previous regime
-            run_length = j - i
-            if run_length < min_holding and i > 0:
-                # Find the previous non-NaN regime
-                prev_regime = np.nan
-                for k in range(i - 1, -1, -1):
-                    if not np.isnan(result[k]):
-                        prev_regime = result[k]
-                        break
-                
-                if not np.isnan(prev_regime):
-                    result[i:j] = prev_regime
-            
-            i = j
-        
+
+            candidate = int(raw_regimes[t])
+            prob_col = candidate  # probs columns are [LowVol, Transition, HighVol]
+            prob_t = probs[t, prob_col] if not np.isnan(probs[t, prob_col]) else 0.0
+
+            if np.isnan(active_regime):
+                # No active regime yet — accept first valid state immediately
+                if prob_t >= prob_threshold:
+                    streak += 1
+                    if streak >= n_days:
+                        active_regime = candidate
+                else:
+                    streak = 0
+                result[t] = active_regime  # stays NaN until confirmed
+                continue
+
+            if candidate == active_regime:
+                # Same regime — reset streak, continue
+                streak = 0
+                result[t] = active_regime
+            else:
+                # Different regime proposed — count consecutive days
+                if prob_t >= prob_threshold:
+                    streak += 1
+                else:
+                    streak = 0
+
+                if streak >= n_days:
+                    active_regime = candidate
+                    streak = 0
+
+                result[t] = active_regime
+
         return result
     
     def predict_realtime(self, observation: np.ndarray) -> Tuple[VolRegime, np.ndarray]:
         """
-        Single-observation real-time prediction.
-        Uses the forward algorithm for efficient online updating.
-        
+        Single-observation real-time prediction using forward filtering.
+
         Args:
             observation: (n_features,) array for one day
-            
+
         Returns:
             regime: VolRegime enum value
-            probs: (n_states,) posterior probabilities
+            probs: (n_states,) filtered probabilities
         """
         if not self._fitted:
             raise RuntimeError("Model not fitted. Call fit_predict() first.")
-        
+
         X = observation.reshape(1, -1)
-        state = self.model.predict(X)[0]
-        probs = self.model.predict_proba(X)[0]
-        
+        states, posteriors = self._predict(X)
+        state = states[0]
+
         regime = self.label_map.get(state, VolRegime.TRANSITION)
-        return regime, probs
+        return regime, posteriors[0]
     
     def get_transition_matrix(self) -> pd.DataFrame:
         """Return the estimated transition matrix with readable labels."""

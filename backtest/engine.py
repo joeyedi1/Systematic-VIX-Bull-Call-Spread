@@ -16,8 +16,9 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import logging
+import calendar
 
 from config.settings import BACKTEST, SIGNAL
 from regime.hmm_classifier import VolRegime
@@ -40,12 +41,6 @@ class Position:
     max_profit: float
     entry_regime: int
     dte_at_entry: int
-    
-    # Optional wide spread
-    has_wide: bool = False
-    wide_short_strike: int = 0
-    wide_entry_price: float = 0.0
-    wide_max_profit: float = 0.0
     
     # Tracking
     current_price: float = 0.0
@@ -110,6 +105,73 @@ class BacktestEngine:
         self.positions: List[Position] = []
         self.closed_positions: List[Position] = []
         self.next_id = 1
+        self._pending_entry = False  # Latched on signal day, executed next bar
+        self._expiry_calendar: List[date] = []  # Built on first run()
+
+    # ------------------------------------------------------------------
+    # VIX expiry calendar helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _third_friday(year: int, month: int) -> date:
+        """Third Friday of a given month."""
+        # First day of the month, find first Friday, then add 2 weeks
+        cal = calendar.monthcalendar(year, month)
+        # calendar weeks: Mon=0 .. Sun=6.  Friday = 4
+        fridays = [week[4] for week in cal if week[4] != 0]
+        return date(year, month, fridays[2])
+
+    @classmethod
+    def _build_vix_expiry_calendar(cls, start_year: int, end_year: int) -> List[date]:
+        """
+        Generate monthly VIX expiry dates.
+
+        CBOE rule: VIX expiry = Wednesday that is exactly 30 calendar days
+        before the third Friday of the *following* calendar month.
+        (30 days before a Friday is always a Wednesday.)
+        """
+        expiries = []
+        for y in range(start_year, end_year + 1):
+            for m in range(1, 13):
+                # "Following month" for month m
+                next_m = m + 1 if m < 12 else 1
+                next_y = y if m < 12 else y + 1
+                third_fri = cls._third_friday(next_y, next_m)
+                expiry = third_fri - timedelta(days=30)
+                expiries.append(expiry)
+        return sorted(expiries)
+
+    def _find_target_expiry(self, entry_date: date) -> Optional[date]:
+        """
+        Find the first VIX expiry within the configured DTE window.
+
+        Returns the expiry date or None if nothing falls in [dte_min, dte_max].
+        """
+        dte_min, dte_max = self.strike_sel.config.dte_range
+        for exp in self._expiry_calendar:
+            dte = (exp - entry_date).days
+            if dte < dte_min:
+                continue
+            if dte > dte_max:
+                return None      # All subsequent expiries are further out
+            return exp
+        return None
+
+    def _get_ux_column(self, current_date: date, target_expiry: date) -> Optional[str]:
+        """
+        Determine which generic UXn column matches a target expiry.
+
+        On any trading day, UX1 = first expiry strictly after today,
+        UX2 = second expiry after today, etc.  Returns e.g. "UX2".
+        """
+        n = 0
+        for exp in self._expiry_calendar:
+            if exp <= current_date:
+                continue          # Already expired / expiring today
+            n += 1
+            if exp == target_expiry:
+                return f"UX{n}" if n <= 9 else None
+        return None               # Target expiry not found in calendar
     
     def run(self, df: pd.DataFrame) -> BacktestResult:
         """
@@ -127,7 +189,12 @@ class BacktestEngine:
         logger.info(f"Period: {df.index.min().date()} to {df.index.max().date()}")
         logger.info(f"Trading days: {len(df)}")
         logger.info("=" * 60)
-        
+
+        # Build VIX expiry calendar covering the full backtest window + margin
+        start_yr = df.index.min().year
+        end_yr = df.index.max().year + 1
+        self._expiry_calendar = self._build_vix_expiry_calendar(start_yr, end_yr)
+
         daily_pnl = pd.Series(0.0, index=df.index, name="Daily_PnL")
         prev_portfolio_value = 0.0
         
@@ -143,9 +210,15 @@ class BacktestEngine:
             # 3. Update cooldown rearm (must run every bar, not just entry days)
             self._update_cooldown_rearm(row)
 
-            # 4. Check entry signals (if capacity available)
-            if row.get("Signal_Entry", False):
+            # 4. Execute pending entry from PREVIOUS day's signal at TODAY's prices
+            #    All guards (capacity, regime, cooldown) checked at execution time.
+            if self._pending_entry:
+                self._pending_entry = False
                 self._try_entry(row, date_str)
+
+            # 5. Latch new entry signal for NEXT bar execution
+            if row.get("Signal_Entry", False):
+                self._pending_entry = True
             
             # 5. Record daily P&L (change in total portfolio value)
             # Portfolio value = unrealized P&L on open + cumulative realized P&L
@@ -178,20 +251,31 @@ class BacktestEngine:
 
     def _try_entry(self, row: pd.Series, date_str: str):
         """Attempt to open a new position if capacity allows."""
-        # Cooldown logic (v1.3: signal-reset based)
+        # Cooldown logic — scan ALL recent closes, not just the last one.
+        # With max_concurrent_positions=2, two positions can close on the
+        # same bar.  If the winner closes last, checking only [-1] would
+        # miss the loser and bypass cooldown.
         if self.closed_positions:
-            last_closed = self.closed_positions[-1]
-            if last_closed.current_pnl < 0:
-                cooldown_type = getattr(self.config, 'cooldown_type', 'calendar')
+            cooldown_type = getattr(self.config, 'cooldown_type', 'calendar')
 
-                if cooldown_type == "signal_reset":
-                    if not getattr(self, '_score_rearmed', True):
-                        return
+            if cooldown_type == "signal_reset":
+                # Blocked if any loss has not yet been rearmed.
+                # _score_rearmed is set False on every loss close
+                # and True only when Signal_Entry goes False on a
+                # subsequent bar (tracked in _update_cooldown_rearm).
+                if not getattr(self, '_score_rearmed', True):
+                    return
 
-                else:  # calendar
-                    last_exit = datetime.strptime(last_closed.exit_date, "%Y-%m-%d")
-                    current = datetime.strptime(date_str, "%Y-%m-%d")
-                    if (current - last_exit).days < self.config.cooldown_after_loss_days:
+            else:  # calendar
+                current = datetime.strptime(date_str, "%Y-%m-%d")
+                cooldown_days = self.config.cooldown_after_loss_days
+                # Check every loss within the calendar window
+                for pos in reversed(self.closed_positions):
+                    exit_dt = datetime.strptime(pos.exit_date, "%Y-%m-%d")
+                    gap = (current - exit_dt).days
+                    if gap >= cooldown_days:
+                        break  # Older closes are outside the window
+                    if pos.current_pnl < 0:
                         return
 
         if len(self.positions) >= self.config.max_concurrent_positions:
@@ -203,39 +287,43 @@ class BacktestEngine:
         
         regime_enum = VolRegime(int(regime))
         
-        # Get VIX futures for strike selection
-        vix_futures = row.get("UX1", row.get("VIX_Spot", None))
+        # Find actual VIX expiry within the DTE window
+        entry_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+        target_expiry = self._find_target_expiry(entry_dt)
+        if target_expiry is None:
+            return
+        actual_dte = (target_expiry - entry_dt).days
+
+        # Resolve the expiry-matched VIX future (UXn)
+        ux_col = self._get_ux_column(entry_dt, target_expiry)
+        if ux_col is None:
+            return
+        vix_futures = row.get(ux_col, None)
         if vix_futures is None or np.isnan(vix_futures) or vix_futures <= 0:
             return
-        
-        # Get VVIX for IV proxy (VVIX ≈ IV of VIX options)
+
+        # Get VVIX for IV proxy (VVIX ~ IV of VIX options)
         vix_iv = row.get("VVIX", None)
         if vix_iv is not None and (np.isnan(vix_iv) or vix_iv <= 0):
             vix_iv = None
-        
-        # Select strikes
-        # Estimate DTE: target the next monthly VIX expiry (~30-45 days out)
-        target_dte = self.strike_sel.config.target_dte
-        
+
+        # Select strikes using real DTE and expiry-matched future
         selection = self.strike_sel.select(
             vix_futures=vix_futures,
             regime=regime_enum,
             vix_iv=vix_iv,
-            dte=target_dte,
+            dte=actual_dte,
         )
-        
+
         if selection is None:
             return
-        
+
         # Apply slippage to entry cost
         entry_cost = selection.estimated_cost * (1 + self.config.entry_slippage_pct)
         entry_cost += self.config.commission_per_contract * 2 / 100  # 2 legs, per $100 multiplier
-        
-        # Estimate expiry date (next monthly VIX expiry, ~45 days out)
-        entry_dt = datetime.strptime(date_str, "%Y-%m-%d")
-        expiry_dt = entry_dt + timedelta(days=target_dte)
-        expiry_str = expiry_dt.strftime("%Y-%m-%d")
-        
+
+        expiry_str = target_expiry.strftime("%Y-%m-%d")
+
         # Open position
         pos = Position(
             id=self.next_id,
@@ -247,16 +335,8 @@ class BacktestEngine:
             spread_width=selection.spread_width,
             max_profit=round(selection.spread_width - entry_cost, 2),
             entry_regime=int(regime),
-            dte_at_entry=target_dte,
+            dte_at_entry=actual_dte,
         )
-        
-        # Add wide spread if selected
-        if selection.wide_short_strike is not None and selection.wide_estimated_cost is not None:
-            wide_cost = selection.wide_estimated_cost * (1 + self.config.entry_slippage_pct)
-            pos.has_wide = True
-            pos.wide_short_strike = selection.wide_short_strike
-            pos.wide_entry_price = round(wide_cost, 2)
-            pos.wide_max_profit = round(selection.wide_short_strike - selection.long_strike - wide_cost, 2)
         
         self.positions.append(pos)
         self.next_id += 1
@@ -268,28 +348,33 @@ class BacktestEngine:
     
     def _update_positions(self, row: pd.Series, date_str: str):
         """Update current price and P&L for all open positions."""
-        vix_futures = row.get("UX1", row.get("VIX_Spot", 0))
-        if vix_futures is None or np.isnan(vix_futures):
-            return
-        
+        current_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+
         for pos in self.positions:
             if not pos.is_open:
                 continue
-            
-            # Estimate current spread value from VIX futures
-            # At expiry: intrinsic value
-            # Before expiry: approximate with intrinsic + time value decay
-            entry_dt = datetime.strptime(pos.entry_date, "%Y-%m-%d")
-            current_dt = datetime.strptime(date_str, "%Y-%m-%d")
-            expiry_dt = datetime.strptime(pos.expiry_date, "%Y-%m-%d")
-            
+
+            expiry_dt = datetime.strptime(pos.expiry_date, "%Y-%m-%d").date()
             pos.current_dte = max(0, (expiry_dt - current_dt).days)
-            
+
+            # Resolve the expiry-matched VIX future for this position
+            ux_col = self._get_ux_column(current_dt, expiry_dt)
+            if ux_col is not None:
+                vix_futures = row.get(ux_col, None)
+            else:
+                vix_futures = None
+
+            # Fallback: if expiry-matched future unavailable (e.g. past
+            # last calendar entry), use UX1 then VIX_Spot
+            if vix_futures is None or np.isnan(vix_futures):
+                vix_futures = row.get("UX1", row.get("VIX_Spot", None))
+            if vix_futures is None or np.isnan(vix_futures):
+                continue
+
             # Simple valuation: intrinsic + declining time value
             intrinsic = self._calc_intrinsic(vix_futures, pos.long_strike, pos.short_strike)
-            
+
             if pos.current_dte > 0:
-                # Time value decays with sqrt(time)
                 time_ratio = np.sqrt(pos.current_dte / pos.dte_at_entry) if pos.dte_at_entry > 0 else 0
                 initial_time_value = max(pos.entry_price - self._calc_intrinsic(
                     vix_futures, pos.long_strike, pos.short_strike
@@ -299,8 +384,11 @@ class BacktestEngine:
             else:
                 # At expiry: intrinsic only
                 pos.current_price = intrinsic
-            
-            pos.current_pnl = pos.current_price - pos.entry_price
+
+            if pos.half_closed:
+                pos.current_pnl = pos.half_closed_pnl + (pos.current_price - pos.entry_price) / 2
+            else:
+                pos.current_pnl = pos.current_price - pos.entry_price
     
     def _check_exits(self, row: pd.Series, date_str: str):
         """Check exit conditions — supports scale-out (v1.3)."""

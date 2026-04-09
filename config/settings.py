@@ -245,8 +245,8 @@ class StrikeConfig:
     min_spread_width: int = 3               # Floor: never less than 3 points
     max_spread_width: int = 8               # Ceiling: never more than 8 points
     
-    # Wide spread (tail risk) overlay
-    include_wide_spread: bool = True
+    # Wide spread (tail risk) overlay — DISABLED until P&L tracking is implemented
+    include_wide_spread: bool = False
     wide_spread_width: int = 20             # C20/C40 style wide spread
     wide_spread_allocation_pct: float = 0.30  # 30% of position in wide spread
     

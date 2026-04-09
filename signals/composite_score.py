@@ -77,20 +77,24 @@ class CompositeSignal:
             "vrp_signal": "SubScore_VRP",
         }
         
-        # Weighted sum (handles NaN gracefully)
+        # Weighted sum with per-row normalization.
+        # Rows where a sub-score is NaN should be divided only by the
+        # weight of the non-NaN signals on that row, not the global total.
         df["Signal_Score"] = 0.0
-        total_weight = 0.0
-        
+        df["_row_weight"] = 0.0
+
         for signal_name, col_name in score_cols.items():
             if col_name in df.columns:
                 w = weights.get(signal_name, 0.0)
                 mask = df[col_name].notna()
                 df.loc[mask, "Signal_Score"] += df.loc[mask, col_name] * w
-                total_weight += w
-        
-        # Normalize by actual available weight
-        if total_weight > 0:
-            df["Signal_Score"] /= total_weight
+                df.loc[mask, "_row_weight"] += w
+
+        # Normalize by per-row available weight
+        valid = df["_row_weight"] > 0
+        df.loc[valid, "Signal_Score"] /= df.loc[valid, "_row_weight"]
+        df.loc[~valid, "Signal_Score"] = np.nan
+        df.drop(columns=["_row_weight"], inplace=True)
         
         # 3. Generate entry decisions (regime-gated, regime-dependent thresholds)
         df["Signal_Entry"] = False

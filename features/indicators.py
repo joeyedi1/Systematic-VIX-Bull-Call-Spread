@@ -292,11 +292,23 @@ def add_cot_features(
 ) -> pd.DataFrame:
     """
     CFTC COT positioning indicators.
-    
+
     Key insight: COT signals FRAGILITY, not timing.
     Extreme net short = coiled spring. But can persist for weeks.
-    Weekly data → forward-fill to daily for alignment.
+    Weekly data -> forward-fill to daily for alignment.
+
+    CFTC release lag: positions are measured Tuesday, published Friday
+    3:30 PM ET. Shift the index from Tuesday to Friday so that ffill
+    makes data available no earlier than the release date.
     """
+    # Enforce CFTC release lag: Tuesday as-of -> Friday publication
+    cot_df = cot_df.copy()
+    # Shift each Tuesday date forward to the following Friday (+3 calendar days).
+    # If the as-of date is not a Tuesday (e.g. holiday-adjusted), shift to the
+    # next Friday anyway (offset to weekday 4 = Friday).
+    shifted_dates = cot_df.index + pd.offsets.Week(weekday=4)
+    cot_df.index = shifted_dates
+
     # Forward-fill weekly COT data to daily
     cot_daily = cot_df.reindex(df.index, method="ffill")
     

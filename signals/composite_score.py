@@ -247,45 +247,38 @@ class ExitSignalGenerator:
         dte: int,
         current_regime: int,
         entry_regime: int,
+        half_closed: bool = False,
     ) -> SignalDecision:
-        """
-        Check if any exit condition is met.
-        
-        Args:
-            current_spread_price: Current market price of the spread
-            entry_price: Price paid at entry
-            max_profit: Theoretical max profit (spread_width - entry_price)
-            dte: Days to expiry
-            current_regime: Current VolRegime
-            entry_regime: Regime when position was entered
-            
-        Returns:
-            SignalDecision indicating whether and why to exit
-        """
         current_pnl = current_spread_price - entry_price
         pnl_pct = current_pnl / entry_price if entry_price > 0 else 0
         profit_pct_of_max = current_pnl / max_profit if max_profit > 0 else 0
         
-        # 1. Profit target: close at 50% of max profit
-        if profit_pct_of_max >= self.config.profit_target_pct:
-            return SignalDecision.EXIT_PROFIT_TARGET
+        # Scale-out logic (v1.3)
+        if not half_closed:
+            # First exit: close half at 50% of max profit
+            first_target = getattr(self.config, 'first_exit_pct', 0.50)
+            if profit_pct_of_max >= first_target:
+                return SignalDecision.EXIT_PROFIT_TARGET
+        else:
+            # Second exit: close remainder at 75% of max profit
+            second_target = getattr(self.config, 'second_exit_pct', 0.75)
+            if profit_pct_of_max >= second_target:
+                return SignalDecision.EXIT_PROFIT_TARGET
         
-        # 2. Pre-settlement: close 1 day before VRO settlement
+        # Pre-settlement
         if dte <= self.config.pre_settlement_close_dte:
             return SignalDecision.EXIT_PRE_SETTLEMENT
         
-        # 3. Time stop: close if DTE <= 21 and at a loss
+        # Time stop (only on remaining half if half already closed)
         if dte <= self.config.time_stop_dte and current_pnl <= 0:
             return SignalDecision.EXIT_TIME_STOP
         
-        # 4. Regime change exit: exit UNCONDITIONALLY if HIGH_VOL detected
-        # Holding losing long-premium in a mean-reverting high-vol environment
-        # is fighting gravity — VIX at 30+ is more likely to fall than spike further
+        # Regime change — unconditional on HIGH_VOL
         if (self.config.regime_exit and 
             current_regime == VolRegime.HIGH_VOL):
             return SignalDecision.EXIT_REGIME_CHANGE
         
-        # 5. Stop loss: close if spread has lost 70% of entry value
+        # Stop loss
         if pnl_pct <= -self.config.stop_loss_pct:
             return SignalDecision.EXIT_STOP_LOSS
         

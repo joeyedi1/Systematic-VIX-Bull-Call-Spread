@@ -4,7 +4,7 @@ backtest/engine.py
 Walk-forward backtest engine for VIX bull call spread strategy.
 
 Handles:
-    - Position lifecycle: entry → management → exit
+    - Position lifecycle: entry -> management -> exit
     - VRO settlement mechanics (or VIX futures proxy)
     - Transaction costs and slippage
     - Performance analytics
@@ -51,6 +51,10 @@ class Position:
     current_price: float = 0.0
     current_pnl: float = 0.0
     current_dte: int = 0
+    # Scale-out tracking (v1.3)
+    half_closed: bool = False
+    half_closed_price: float = 0.0
+    half_closed_pnl: float = 0.0
     exit_date: Optional[str] = None
     exit_price: float = 0.0
     exit_reason: str = ""
@@ -129,18 +133,21 @@ class BacktestEngine:
         
         for i, (date, row) in enumerate(df.iterrows()):
             date_str = date.strftime("%Y-%m-%d")
-            
+
             # 1. Update open positions with current prices
             self._update_positions(row, date_str)
-            
+
             # 2. Check exit signals for open positions
             self._check_exits(row, date_str)
-            
-            # 3. Check entry signals (if capacity available)
+
+            # 3. Update cooldown rearm (must run every bar, not just entry days)
+            self._update_cooldown_rearm(row)
+
+            # 4. Check entry signals (if capacity available)
             if row.get("Signal_Entry", False):
                 self._try_entry(row, date_str)
             
-            # 4. Record daily P&L (change in total portfolio value)
+            # 5. Record daily P&L (change in total portfolio value)
             # Portfolio value = unrealized P&L on open + cumulative realized P&L
             unrealized = sum(p.current_pnl for p in self.positions if p.is_open)
             realized = sum(p.current_pnl for p in self.closed_positions)
@@ -156,16 +163,36 @@ class BacktestEngine:
         
         return result
     
+    def _update_cooldown_rearm(self, row: pd.Series):
+        """
+        Track signal-reset cooldown on every bar.
+
+        Rearm when Signal_Entry turns off after a loss. This must run
+        every bar (not just entry days) so the system sees the signal
+        go False before it goes True again.
+        """
+        if getattr(self, '_score_rearmed', True):
+            return  # Already rearmed or no cooldown active
+        if not row.get("Signal_Entry", False):
+            self._score_rearmed = True
+
     def _try_entry(self, row: pd.Series, date_str: str):
         """Attempt to open a new position if capacity allows."""
-        # Cooldown: don't re-enter within N days of a losing exit
+        # Cooldown logic (v1.3: signal-reset based)
         if self.closed_positions:
             last_closed = self.closed_positions[-1]
             if last_closed.current_pnl < 0:
-                last_exit = datetime.strptime(last_closed.exit_date, "%Y-%m-%d")
-                current = datetime.strptime(date_str, "%Y-%m-%d")
-                if (current - last_exit).days < self.config.cooldown_after_loss_days:
-                    return
+                cooldown_type = getattr(self.config, 'cooldown_type', 'calendar')
+
+                if cooldown_type == "signal_reset":
+                    if not getattr(self, '_score_rearmed', True):
+                        return
+
+                else:  # calendar
+                    last_exit = datetime.strptime(last_closed.exit_date, "%Y-%m-%d")
+                    current = datetime.strptime(date_str, "%Y-%m-%d")
+                    if (current - last_exit).days < self.config.cooldown_after_loss_days:
+                        return
 
         if len(self.positions) >= self.config.max_concurrent_positions:
             return
@@ -276,14 +303,14 @@ class BacktestEngine:
             pos.current_pnl = pos.current_price - pos.entry_price
     
     def _check_exits(self, row: pd.Series, date_str: str):
-        """Check exit conditions for all open positions."""
+        """Check exit conditions — supports scale-out (v1.3)."""
         regime = row.get("Regime", None)
         if regime is not None and not np.isnan(regime):
             current_regime = int(regime)
         else:
             current_regime = VolRegime.TRANSITION
         
-        positions_to_close = []
+        positions_to_act = []
         
         for pos in self.positions:
             if not pos.is_open:
@@ -296,33 +323,65 @@ class BacktestEngine:
                 dte=pos.current_dte,
                 current_regime=current_regime,
                 entry_regime=pos.entry_regime,
+                half_closed=pos.half_closed,
             )
             
             if decision != SignalDecision.NO_SIGNAL:
-                positions_to_close.append((pos, decision, date_str))
+                positions_to_act.append((pos, decision, date_str))
         
-        for pos, decision, date_str in positions_to_close:
-            self._close_position(pos, date_str, decision.name)
+        for pos, decision, date_str in positions_to_act:
+            if decision == SignalDecision.EXIT_PROFIT_TARGET and not pos.half_closed:
+                # Scale-out: close first half, keep position open
+                self._half_close_position(pos, date_str)
+            else:
+                # Full close (second target, time stop, regime change, etc.)
+                self._close_position(pos, date_str, decision.name)
     
     def _close_position(self, pos: Position, date_str: str, reason: str):
-        """Close a position and move to closed list."""
-        # Apply exit slippage
+        """Close position (or remaining half if partially closed)."""
         exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
         exit_price -= self.config.commission_per_contract * 2 / 100
         
         pos.exit_date = date_str
         pos.exit_price = round(max(exit_price, 0), 2)
+        
+        if pos.half_closed:
+            # Second half P&L
+            second_half_pnl = (pos.exit_price - pos.entry_price) / 2
+            pos.current_pnl = round(pos.half_closed_pnl + second_half_pnl, 2)
+        else:
+            pos.current_pnl = round(pos.exit_price - pos.entry_price, 2)
+        
         pos.exit_reason = reason
-        pos.current_pnl = pos.exit_price - pos.entry_price
         
         self.closed_positions.append(pos)
         self.positions.remove(pos)
+
+        # Reset cooldown rearm flag on new loss
+        if pos.current_pnl < 0:
+            self._score_rearmed = False
         
         pnl_sign = "+" if pos.current_pnl >= 0 else ""
+        half_tag = " [scaled-out]" if pos.half_closed else ""
         logger.debug(
-            f"EXIT #{pos.id} on {date_str} ({reason}): "
+            f"EXIT #{pos.id} on {date_str} ({reason}{half_tag}): "
             f"C{pos.long_strike}/C{pos.short_strike} "
             f"PnL: {pnl_sign}${pos.current_pnl:.2f}"
+        )
+    
+    def _half_close_position(self, pos: Position, date_str: str):
+        """Close first half of position at profit target. Keep remainder open."""
+        exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
+        exit_price -= self.config.commission_per_contract * 2 / 100
+        
+        pos.half_closed = True
+        pos.half_closed_price = round(max(exit_price, 0), 2)
+        pos.half_closed_pnl = round((pos.half_closed_price - pos.entry_price) / 2, 2)  # Half the P&L
+        
+        logger.debug(
+            f"HALF-CLOSE #{pos.id} on {date_str}: "
+            f"C{pos.long_strike}/C{pos.short_strike} "
+            f"Half P&L: +${pos.half_closed_pnl:.2f}"
         )
     
     def _close_all_remaining(self, row: pd.Series, date_str: str):
@@ -396,10 +455,19 @@ class BacktestEngine:
             dd = cum - peak
             result.max_drawdown = dd.min()
             
-            # Sharpe (annualized, daily P&L is already in change form)
-            active_pnl = daily_pnl[daily_pnl != 0]
-            if len(active_pnl) > 1 and active_pnl.std() > 0:
-                result.sharpe_ratio = active_pnl.mean() / active_pnl.std() * np.sqrt(252)
+            # Sharpe on premium-at-risk basis (v1.3)
+            # Denominator: average capital deployed (entry price * holding days)
+            total_premium_days = sum(
+                t["entry_price"] * t["holding_days"] for t in trades if t["holding_days"] > 0
+            )
+            trading_days = len(daily_pnl[daily_pnl != 0])
+            avg_premium_at_risk = total_premium_days / max(trading_days, 1)
+            
+            if avg_premium_at_risk > 0:
+                daily_return = daily_pnl / avg_premium_at_risk
+                active_returns = daily_return[daily_return != 0]
+                if len(active_returns) > 1 and active_returns.std() > 0:
+                    result.sharpe_ratio = active_returns.mean() / active_returns.std() * np.sqrt(252)
         
         return result
     
@@ -424,9 +492,9 @@ class BacktestEngine:
         for t in result.trades:
             sign = "+" if t["pnl"] >= 0 else ""
             print(
-                f"  #{t['id']:3d} | {t['entry_date']} → {t['exit_date']} | "
+                f"  #{t['id']:3d} | {t['entry_date']} -> {t['exit_date']} | "
                 f"C{t['long_strike']}/C{t['short_strike']} | "
-                f"${t['entry_price']:.2f} → ${t['exit_price']:.2f} | "
+                f"${t['entry_price']:.2f} -> ${t['exit_price']:.2f} | "
                 f"{sign}${t['pnl']:.2f} ({sign}{t['pnl_pct']:.0f}%) | "
                 f"{t['exit_reason']} | {t['regime_at_entry']}"
             )

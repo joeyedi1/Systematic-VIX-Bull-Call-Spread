@@ -133,7 +133,10 @@ class BacktestConfig:
     # max_concurrent_positions: int = 3       # Max 3 open spreads at once
     max_concurrent_positions: int = 2       # Was 3 — reduces correlated drawdowns
     
-    cooldown_after_loss_days: int = 10      # Don't re-enter for 10 days after a losing exit
+    # Cooldown — signal-reset based (v1.3)
+    cooldown_type: str = "signal_reset"     # "calendar" or "signal_reset"
+    cooldown_after_loss_days: int = 10      # Only used if cooldown_type = "calendar"
+    cooldown_score_rearm: float = 0.65      # Was 0.50 — too strict, score rarely drops that low in LOW_VOL
 
     # Settlement
     use_vro_settlement: bool = True         # Use VRO when available, else VIX futures proxy
@@ -215,12 +218,14 @@ class SignalConfig:
     cot_extreme_percentile: int = 90                  # Net short above 90th pctl = extreme
     vrp_threshold: float = 5.0                        # VIX - RV > 5 = large headwind
     
-    # Exit rules
-    profit_target_pct: float = 0.50         # Close at 50% of max profit
-    time_stop_dte: int = 21                 # Close if DTE <= 21 and not profitable
-    regime_exit: bool = True                # Close if regime shifts to high_vol (already profitable)
-    pre_settlement_close_dte: int = 1       # Close 1 day before settlement
-    stop_loss_pct: float = 0.70             # Close if spread loses 70% of entry value
+    # Exit rules — scale-out (NEW in v1.3)
+    first_exit_pct: float = 0.50            # Close HALF at 50% of max profit
+    second_exit_pct: float = 0.75           # Close remainder at 75% of max profit
+    second_exit_fallback: str = "regime"    # If 75% not hit, exit on regime change or time stop
+    time_stop_dte: int = 21                 # Close remaining if DTE <= 21 and at a loss
+    regime_exit: bool = True                # Close remaining if HIGH_VOL detected
+    pre_settlement_close_dte: int = 1
+    stop_loss_pct: float = 0.70
 
 # ============================================================
 # 7. STRIKE SELECTION PARAMETERS
@@ -235,12 +240,10 @@ class StrikeConfig:
     short_delta_target: float = 0.25        # Sell 25-delta call
     delta_tolerance: float = 0.05           # Accept ±0.05 from target
     
-    # Regime-dependent spread widths
-    spread_widths: Dict[str, int] = field(default_factory=lambda: {
-        "low_vol": 5,           # 5-point spread in low vol
-        "transition": 5,        # 5-point spread in transition
-        "high_vol": 0,          # No new entries in high vol
-    })
+    # Regime-dependent spread widths — as percentage of VIX futures (v1.3)
+    spread_width_pct: float = 0.30          # 30% of VIX futures level
+    min_spread_width: int = 3               # Floor: never less than 3 points
+    max_spread_width: int = 8               # Ceiling: never more than 8 points
     
     # Wide spread (tail risk) overlay
     include_wide_spread: bool = True

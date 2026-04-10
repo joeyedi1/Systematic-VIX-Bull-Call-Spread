@@ -207,7 +207,7 @@ class SignalConfig:
     })
     
     # Entry thresholds — regime-dependent
-    entry_score_threshold: float = 0.70          # LOW_VOL entry threshold
+    entry_score_threshold: float = 0.65          # v1.5: was 0.70, recalibrated for clean engine
     transition_score_threshold: float = 999.0    # Effectively disabled — LOW_VOL only
     
     # Individual indicator thresholds
@@ -218,11 +218,11 @@ class SignalConfig:
     cot_extreme_percentile: int = 90                  # Net short above 90th pctl = extreme
     vrp_threshold: float = 5.0                        # VIX - RV > 5 = large headwind
     
-    # Exit rules — scale-out (NEW in v1.3)
-    first_exit_pct: float = 0.50            # Close HALF at 50% of max profit
-    second_exit_pct: float = 0.75           # Close remainder at 75% of max profit
-    second_exit_fallback: str = "regime"    # If 75% not hit, exit on regime change or time stop
-    time_stop_dte: int = 21                 # Close remaining if DTE <= 21 and at a loss
+    # Exit rules — scale-out (v1.3, recalibrated v1.5)
+    first_exit_pct: float = 0.30            # v1.5: was 0.50, lowered for UX2/UX3 pricing
+    second_exit_pct: float = 0.60           # v1.5: was 0.75, lowered — take profit before decay
+    second_exit_fallback: str = "regime"    # If 60% not hit, exit on regime change or time stop
+    time_stop_dte: int = 10                 # v1.5: was 21, tighter cut on losers
     regime_exit: bool = True                # Close remaining if HIGH_VOL detected
     pre_settlement_close_dte: int = 1
     stop_loss_pct: float = 0.70
@@ -250,9 +250,9 @@ class StrikeConfig:
     wide_spread_width: int = 20             # C20/C40 style wide spread
     wide_spread_allocation_pct: float = 0.30  # 30% of position in wide spread
     
-    # DTE targeting
-    target_dte: int = 45                    # Enter 45 days before expiry
-    dte_range: Tuple[int, int] = (30, 60)   # Acceptable DTE window
+    # DTE targeting — v1.5: shifted to further-out expiry for more runway
+    target_dte: int = 65                    # v1.5: was 45, target ~65 DTE expiry
+    dte_range: Tuple[int, int] = (50, 80)   # v1.5: was (30, 60), matches UX3 territory
     
     # Strike rounding
     strike_increment: float = 1.0           # VIX options have $1 strike increments

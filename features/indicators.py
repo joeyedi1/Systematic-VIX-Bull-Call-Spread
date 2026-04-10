@@ -163,9 +163,15 @@ def add_vix_level_features(df: pd.DataFrame, config: object = FEATURE) -> pd.Dat
     # 8. Realized volatility of VIX (vol of vol, from returns)
     df["VIX_RealizedVol_21d"] = df["VIX_LogReturn"].rolling(21, min_periods=10).std() * np.sqrt(252)
     
-    # 9. VIX 5-day and 20-day moving averages
+    # 9. VIX 5-day, 10-day and 20-day moving averages
     df["VIX_MA5"] = vix.rolling(5).mean()
+    df["VIX_SMA10"] = vix.rolling(10, min_periods=5).mean()
     df["VIX_MA20"] = vix.rolling(20).mean()
+
+    # 10. VIX SMA10 momentum slope: (SMA10_today - SMA10_5d_ago) / SMA10_5d_ago
+    # Negative = VIX declining on a smoothed basis; used for post-spike recovery filter
+    sma10_lag = df["VIX_SMA10"].shift(5)
+    df["VIX_SMA10_Slope_5d"] = (df["VIX_SMA10"] - sma10_lag) / sma10_lag
     
     # 10. VIX regime indicator: VIX9D/VIX ratio (short-term stress)
     if "VIX9D" in df.columns:

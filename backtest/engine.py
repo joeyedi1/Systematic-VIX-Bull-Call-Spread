@@ -20,10 +20,11 @@ from datetime import datetime, timedelta, date
 import logging
 import calendar
 
-from config.settings import BACKTEST, SIGNAL
+from config.settings import BACKTEST, SIGNAL, STRIKE
 from regime.hmm_classifier import VolRegime
 from signals.composite_score import SignalDecision, ExitSignalGenerator
 from strikes.selector import StrikeSelector, SpreadSelection
+from data.option_chain_store import OptionChainStore
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +98,27 @@ class BacktestEngine:
         self,
         config: object = BACKTEST,
         signal_config: object = SIGNAL,
+        strike_config: object = STRIKE,
     ):
         self.config = config
         self.exit_gen = ExitSignalGenerator(signal_config)
-        self.strike_sel = StrikeSelector()
+        self.strike_sel = StrikeSelector(strike_config)
         
         self.positions: List[Position] = []
         self.closed_positions: List[Position] = []
         self.next_id = 1
         self._pending_entry = False  # Latched on signal day, executed next bar
         self._expiry_calendar: List[date] = []  # Built on first run()
+
+        # Real option chain prices for MTM (falls back to synthetic if unavailable)
+        chain_store = OptionChainStore()
+        self._chain_store: Optional[OptionChainStore] = (
+            chain_store if chain_store.available() else None
+        )
+        if self._chain_store is not None:
+            logger.info("OptionChainStore: real NBBO mid prices active for MTM.")
+        else:
+            logger.info("OptionChainStore: no chain data found — using synthetic MTM.")
 
     # ------------------------------------------------------------------
     # VIX expiry calendar helpers
@@ -286,7 +298,36 @@ class BacktestEngine:
             return
         
         regime_enum = VolRegime(int(regime))
-        
+
+        # Post-spike recovery filter: block entry when VIX SMA10 is declining
+        # faster than threshold over the past 5 days.  Catches the regime where
+        # the HMM sees LOW_VOL but VIX is still mean-reverting downward from a
+        # spike — bull call spread entries die as both legs go OTM.
+        if self.config.vix_momentum_threshold is not None:
+            slope = row.get("VIX_SMA10_Slope_5d", None)
+            if slope is not None and not np.isnan(float(slope)):
+                if float(slope) < self.config.vix_momentum_threshold:
+                    return
+
+        # UX2 cap: block when the generic second-month future is elevated.
+        # Post-spike recovery shows low spot VIX but persistently high UX2,
+        # meaning the curve is not yet pricing normalisation — wrong environment
+        # for bull call spreads on the target expiry.
+        if self.config.max_ux2 is not None:
+            ux2 = row.get("UX2", None)
+            if ux2 is not None and not np.isnan(float(ux2)):
+                if float(ux2) > self.config.max_ux2:
+                    return
+
+        # VIX percentile floor: block when VIX is at the bottom of its 1-year
+        # range.  Low percentile = options cheap but VIX has room to keep falling;
+        # spread entries here consistently lose as both legs go OTM.
+        if self.config.min_vix_pctl_1yr is not None:
+            pctl = row.get("VIX_Pctl_1yr", None)
+            if pctl is not None and not np.isnan(float(pctl)):
+                if float(pctl) < self.config.min_vix_pctl_1yr:
+                    return
+
         # Find actual VIX expiry within the DTE window
         entry_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
         target_expiry = self._find_target_expiry(entry_dt)
@@ -300,6 +341,11 @@ class BacktestEngine:
             return
         vix_futures = row.get(ux_col, None)
         if vix_futures is None or np.isnan(vix_futures) or vix_futures <= 0:
+            return
+
+        # VIX futures level cap: block entries above the configured ceiling
+        max_ux = getattr(self.config, 'max_entry_vix_futures', None)
+        if max_ux is not None and vix_futures > max_ux:
             return
 
         # Get VVIX for IV proxy (VVIX ~ IV of VIX options)
@@ -318,25 +364,71 @@ class BacktestEngine:
         if selection is None:
             return
 
-        # Apply slippage to entry cost
-        entry_cost = selection.estimated_cost * (1 + self.config.entry_slippage_pct)
-        entry_cost += self.config.commission_per_contract * 2 / 100  # 2 legs, per $100 multiplier
-
         expiry_str = target_expiry.strftime("%Y-%m-%d")
+        exec_mode = getattr(self.config, "execution_mode", "market")
+        pos_type = getattr(self.config, "position_type", "spread")
 
-        # Open position
+        if pos_type == "call":
+            # ---- Outright long call (no short leg) ----
+            # Entry: mid price (hybrid/limit) or ask (market)
+            real_cost = None
+            if self._chain_store is not None:
+                if exec_mode in ("hybrid", "limit"):
+                    real_cost = self._chain_store.get_call_mid(
+                        expiry_str, date_str, selection.long_strike
+                    )
+                else:
+                    real_cost = self._chain_store.get_call_ask(
+                        expiry_str, date_str, selection.long_strike
+                    )
+            if real_cost is None or real_cost <= 0:
+                # Synthetic fallback: Black-76 single call estimate
+                real_cost = self.strike_sel._estimate_spread_cost(
+                    vix_futures, selection.long_strike, selection.long_strike + 999,
+                    vix_iv, actual_dte
+                ) + selection.estimated_cost  # rough: reuse spread formula long leg
+                real_cost = max(real_cost * 0.6, 0.20)  # single leg rough heuristic
+            entry_cost = real_cost + self.config.commission_per_contract / 100  # 1 leg
+            spread_width = 0     # no cap on outright call
+            call_profit_target = getattr(self.config, 'call_profit_target_pct', 1.0)
+            max_profit_val = entry_cost * call_profit_target
+        else:
+            # ---- Bull call spread ----
+            # Entry cost: ask(long)-bid(short) for "market"; mid(long)-mid(short)
+            # for "hybrid"/"limit".  Falls back to synthetic when chain is unavailable.
+            real_cost = None
+            if self._chain_store is not None:
+                if exec_mode in ("hybrid", "limit"):
+                    real_cost = self._chain_store.get_spread_mid(
+                        expiry_str, date_str, selection.long_strike, selection.short_strike
+                    )
+                else:
+                    real_cost = self._chain_store.get_entry_cost(
+                        expiry_str, date_str, selection.long_strike, selection.short_strike
+                    )
+            if real_cost is not None:
+                entry_cost = real_cost
+            else:
+                entry_cost = selection.estimated_cost * (1 + self.config.entry_slippage_pct)
+            entry_cost += self.config.commission_per_contract * 2 / 100  # 2 legs
+            spread_width = selection.spread_width
+            max_profit_val = spread_width - entry_cost
+
+        # Open position — short_strike=0 signals outright call to other methods
         pos = Position(
             id=self.next_id,
             entry_date=date_str,
             expiry_date=expiry_str,
             long_strike=selection.long_strike,
-            short_strike=selection.short_strike,
+            short_strike=selection.long_strike if pos_type == "call" else selection.short_strike,
             entry_price=round(entry_cost, 2),
-            spread_width=selection.spread_width,
-            max_profit=round(selection.spread_width - entry_cost, 2),
+            spread_width=spread_width,
+            max_profit=round(max_profit_val, 2),
             entry_regime=int(regime),
             dte_at_entry=actual_dte,
         )
+        # Tag so downstream methods know how to price exits
+        pos._position_type = pos_type
         
         self.positions.append(pos)
         self.next_id += 1
@@ -371,19 +463,34 @@ class BacktestEngine:
             if vix_futures is None or np.isnan(vix_futures):
                 continue
 
-            # Simple valuation: intrinsic + declining time value
-            intrinsic = self._calc_intrinsic(vix_futures, pos.long_strike, pos.short_strike)
+            # Mark-to-market: real NBBO mid when available, synthetic fallback
+            pos_type = getattr(pos, '_position_type', 'spread')
+            real_price = None
+            if self._chain_store is not None:
+                if pos_type == "call":
+                    real_price = self._chain_store.get_call_mid(
+                        pos.expiry_date, date_str, pos.long_strike
+                    )
+                else:
+                    real_price = self._chain_store.get_spread_mid(
+                        pos.expiry_date, date_str, pos.long_strike, pos.short_strike
+                    )
 
-            if pos.current_dte > 0:
-                time_ratio = np.sqrt(pos.current_dte / pos.dte_at_entry) if pos.dte_at_entry > 0 else 0
-                initial_time_value = max(pos.entry_price - self._calc_intrinsic(
-                    vix_futures, pos.long_strike, pos.short_strike
-                ), 0)
-                time_value = initial_time_value * time_ratio * 0.5  # Conservative
-                pos.current_price = intrinsic + time_value
+            if real_price is not None:
+                pos.current_price = real_price
             else:
-                # At expiry: intrinsic only
-                pos.current_price = intrinsic
+                # Synthetic fallback: intrinsic + declining time value
+                if pos_type == "call":
+                    intrinsic = max(vix_futures - pos.long_strike, 0)
+                else:
+                    intrinsic = self._calc_intrinsic(vix_futures, pos.long_strike, pos.short_strike)
+                if pos.current_dte > 0:
+                    time_ratio = np.sqrt(pos.current_dte / pos.dte_at_entry) if pos.dte_at_entry > 0 else 0
+                    initial_time_value = max(pos.entry_price - intrinsic, 0)
+                    time_value = initial_time_value * time_ratio * 0.5  # Conservative
+                    pos.current_price = intrinsic + time_value
+                else:
+                    pos.current_price = intrinsic
 
             if pos.half_closed:
                 pos.current_pnl = pos.half_closed_pnl + (pos.current_price - pos.entry_price) / 2
@@ -417,8 +524,11 @@ class BacktestEngine:
             if decision != SignalDecision.NO_SIGNAL:
                 positions_to_act.append((pos, decision, date_str))
         
+        scale_out = getattr(self.config, 'scale_out', True)
         for pos, decision, date_str in positions_to_act:
-            if decision == SignalDecision.EXIT_PROFIT_TARGET and not pos.half_closed:
+            if (decision == SignalDecision.EXIT_PROFIT_TARGET
+                    and not pos.half_closed
+                    and scale_out):
                 # Scale-out: close first half, keep position open
                 self._half_close_position(pos, date_str)
             else:
@@ -427,8 +537,34 @@ class BacktestEngine:
     
     def _close_position(self, pos: Position, date_str: str, reason: str):
         """Close position (or remaining half if partially closed)."""
-        exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
-        exit_price -= self.config.commission_per_contract * 2 / 100
+        exec_mode = getattr(self.config, "execution_mode", "market")
+        pos_type = getattr(pos, '_position_type', 'spread')
+        real_proceeds = None
+        if self._chain_store is not None:
+            if pos_type == "call":
+                # Outright call: sell at bid (market) or mid (limit)
+                if exec_mode == "limit":
+                    real_proceeds = self._chain_store.get_call_mid(
+                        pos.expiry_date, date_str, pos.long_strike
+                    )
+                else:
+                    real_proceeds = self._chain_store.get_call_bid(
+                        pos.expiry_date, date_str, pos.long_strike
+                    )
+            elif exec_mode == "limit":
+                real_proceeds = self._chain_store.get_spread_mid(
+                    pos.expiry_date, date_str, pos.long_strike, pos.short_strike
+                )
+            else:
+                real_proceeds = self._chain_store.get_exit_proceeds(
+                    pos.expiry_date, date_str, pos.long_strike, pos.short_strike
+                )
+        if real_proceeds is not None:
+            exit_price = real_proceeds
+        else:
+            exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
+        comm_legs = 1 if pos_type == "call" else 2
+        exit_price -= self.config.commission_per_contract * comm_legs / 100
         
         pos.exit_date = date_str
         pos.exit_price = round(max(exit_price, 0), 2)
@@ -459,8 +595,33 @@ class BacktestEngine:
     
     def _half_close_position(self, pos: Position, date_str: str):
         """Close first half of position at profit target. Keep remainder open."""
-        exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
-        exit_price -= self.config.commission_per_contract * 2 / 100
+        exec_mode = getattr(self.config, "execution_mode", "market")
+        pos_type = getattr(pos, '_position_type', 'spread')
+        real_proceeds = None
+        if self._chain_store is not None:
+            if pos_type == "call":
+                if exec_mode == "limit":
+                    real_proceeds = self._chain_store.get_call_mid(
+                        pos.expiry_date, date_str, pos.long_strike
+                    )
+                else:
+                    real_proceeds = self._chain_store.get_call_bid(
+                        pos.expiry_date, date_str, pos.long_strike
+                    )
+            elif exec_mode == "limit":
+                real_proceeds = self._chain_store.get_spread_mid(
+                    pos.expiry_date, date_str, pos.long_strike, pos.short_strike
+                )
+            else:
+                real_proceeds = self._chain_store.get_exit_proceeds(
+                    pos.expiry_date, date_str, pos.long_strike, pos.short_strike
+                )
+        if real_proceeds is not None:
+            exit_price = real_proceeds
+        else:
+            exit_price = pos.current_price * (1 - self.config.exit_slippage_pct)
+        comm_legs = 1 if pos_type == "call" else 2
+        exit_price -= self.config.commission_per_contract * comm_legs / 100
         
         pos.half_closed = True
         pos.half_closed_price = round(max(exit_price, 0), 2)

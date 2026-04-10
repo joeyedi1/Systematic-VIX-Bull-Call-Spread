@@ -9,7 +9,7 @@ Changes here propagate through the entire system.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from datetime import date
 
 # ============================================================
@@ -124,8 +124,9 @@ class BacktestConfig:
     min_training_days: int = 252            # Minimum 1 year before first signal
     
     # Execution assumptions
-    entry_slippage_pct: float = 0.05        # 5% of spread price
-    exit_slippage_pct: float = 0.05
+    # Real NBBO bid/ask spread IS the slippage — no additional charge
+    entry_slippage_pct: float = 0.00
+    exit_slippage_pct: float = 0.00
     commission_per_contract: float = 1.32   # Per leg, per contract (CBOE VIX options)
     
     # Position sizing
@@ -137,6 +138,36 @@ class BacktestConfig:
     cooldown_type: str = "signal_reset"     # "calendar" or "signal_reset"
     cooldown_after_loss_days: int = 10      # Only used if cooldown_type = "calendar"
     cooldown_score_rearm: float = 0.65      # Was 0.50 — too strict, score rarely drops that low in LOW_VOL
+
+    # VIX futures level cap — block entry when expiry-matched futures exceeds this.
+    # None = disabled. e.g. 20.0 = block if target-expiry futures > 20.
+    max_entry_vix_futures: Optional[float] = None
+
+    # UX2 cap — block entry when the generic second-month VIX future exceeds this.
+    # Targets the post-spike recovery regime where the curve is still elevated
+    # even after spot VIX has mean-reverted.  None = disabled.
+    max_ux2: Optional[float] = None
+
+    # VIX 1-year percentile floor — block entry when VIX is near bottom of
+    # its 1-year range (options are cheap but there is no vol left to spike).
+    # None = disabled.  e.g. 25.0 = require VIX >= 25th pctl of past year.
+    min_vix_pctl_1yr: Optional[float] = None
+
+    # Structure tests
+    scale_out: bool = True          # True = 30%/60% scale-out; False = single full exit
+    position_type: str = "spread"   # "spread" or "call" (outright long call, no short leg)
+    call_profit_target_pct: float = 1.0  # 100% gain target for outright call
+
+    # Post-spike recovery filter
+    # Block entry when VIX SMA10 is declining faster than this threshold over 5 days.
+    # None = disabled (baseline). e.g. -0.05 = block when SMA10 down >5% in 5 days.
+    vix_momentum_threshold: Optional[float] = None
+
+    # Execution pricing model
+    # "market" : entry = ask(long)-bid(short), exit = bid(long)-ask(short)  [default]
+    # "hybrid" : entry = mid(long)-mid(short), exit = bid(long)-ask(short)
+    # "limit"  : entry = mid(long)-mid(short), exit = mid(long)-mid(short)
+    execution_mode: str = "market"
 
     # Settlement
     use_vro_settlement: bool = True         # Use VRO when available, else VIX futures proxy
@@ -245,6 +276,10 @@ class StrikeConfig:
     min_spread_width: int = 3               # Floor: never less than 3 points
     max_spread_width: int = 8               # Ceiling: never more than 8 points
     
+    # Force a fixed spread width (overrides dynamic width_pct calculation).
+    # None = use dynamic width_pct; int = use exactly this many points.
+    spread_width_override: Optional[int] = None
+
     # Wide spread (tail risk) overlay — DISABLED until P&L tracking is implemented
     include_wide_spread: bool = False
     wide_spread_width: int = 20             # C20/C40 style wide spread

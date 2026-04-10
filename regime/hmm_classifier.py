@@ -18,6 +18,7 @@ Key design decisions (from literature):
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 from enum import IntEnum
 import logging
@@ -112,39 +113,64 @@ class RegimeClassifier:
         if n < min_train:
             logger.warning(f"Not enough data ({n} rows) for minimum training ({min_train}). Returning NaN regimes.")
             return df
-        
+
+        # Load extended pre-training data (2010-2021) if available.
+        # This is prepended to every walk-forward fit so the HMM understands
+        # 12 years of VIX behaviour before it sees its first live trading day.
+        pretrain_X = self._load_pretrain_features(feature_cols)
+
         # Walk-forward loop
         fit_start = 0
         predict_start = max(min_train, train_window)
         refit_count = 0
-        
+
         while predict_start < n:
             predict_end = min(predict_start + refit_freq, n)
-            
+
             # Extract training data (expanding window from start)
             train_data = df.iloc[fit_start:predict_start][feature_cols].dropna()
-            
+
             if len(train_data) < min_train:
                 predict_start = predict_end
                 continue
-            
-            # Fit HMM
+
+            # Fit HMM — prepend extended history so the model is initialised on
+            # the full 2010-2021 distribution, not just the current live window.
             X_train = train_data.values
-            self._fit_hmm(X_train)
+            X_fit = np.vstack([pretrain_X, X_train]) if pretrain_X is not None else X_train
+            self._fit_hmm(X_fit)
             refit_count += 1
-            
+            if pretrain_X is not None:
+                logger.debug(
+                    f"  Fit #{refit_count}: {len(pretrain_X)} pretrain + "
+                    f"{len(X_train)} live = {len(X_fit)} total days"
+                )
+
             # Predict on the next chunk (and all prior data for consistency)
             predict_data = df.iloc[:predict_end][feature_cols].dropna()
             X_predict = predict_data.values
-            
+
             if len(X_predict) == 0:
                 predict_start = predict_end
                 continue
-            
+
             states, posteriors = self._predict(X_predict)
-            
-            # Map HMM states to VolRegime labels
-            mapped_states = self._map_labels(states, X_train)
+
+            # Map HMM states to VolRegime labels.
+            # When pre-training data is present we must not pass the combined
+            # X_fit to _map_labels, because it uses states[:len(X_train)] for
+            # variance estimation and X_fit is longer than the prediction
+            # sequence.  Instead, run the forward algorithm on the live
+            # training data only to establish the label_map, then apply that
+            # map to the full prediction.
+            if pretrain_X is not None:
+                states_live, _ = self._predict(X_train)
+                self._map_labels(states_live, X_train)   # sets self.label_map
+                mapped_states = np.array(
+                    [self.label_map.get(s, VolRegime.TRANSITION) for s in states]
+                )
+            else:
+                mapped_states = self._map_labels(states, X_train)
             
             # Write predictions for the current chunk only
             chunk_indices = df.iloc[predict_start:predict_end].index
@@ -285,6 +311,66 @@ class RegimeClassifier:
         reverse_map = {v: k for k, v in self.label_map.items()}
         return reverse_map.get(regime, int(regime))
     
+    def _load_pretrain_features(
+        self,
+        feature_cols: List[str],
+        cache_file: str = "vix_extended_history_2010_2021.parquet",
+    ) -> Optional[np.ndarray]:
+        """
+        Load extended history (2010-2021) and derive HMM input features.
+
+        Computes HMM_VIX_LogReturn_Std and HMM_TS_Slope_Std using the same
+        expanding-window standardisation as features/indicators.py so the
+        scale is consistent with the live data fed into fit_predict().
+
+        Returns:
+            (n_pretrain, n_features) float array, or None if cache absent.
+        """
+        cache_path = Path("outputs/cache") / cache_file
+        if not cache_path.exists():
+            logger.info("Extended history cache not found — skipping HMM pre-training.")
+            return None
+
+        logger.info(f"Loading extended history for HMM pre-training: {cache_path}")
+        raw = pd.read_parquet(cache_path)
+
+        features = pd.DataFrame(index=raw.index)
+
+        # Primary feature: VIX log-return, expanding standardisation
+        if "VIX_Spot" in raw.columns:
+            lr = np.log(raw["VIX_Spot"] / raw["VIX_Spot"].shift(1))
+            lr_mean = lr.expanding(min_periods=21).mean()
+            lr_std = lr.expanding(min_periods=21).std()
+            features["HMM_VIX_LogReturn_Std"] = (lr - lr_mean) / lr_std
+
+        # Secondary feature: term-structure slope, expanding standardisation
+        if "UX1" in raw.columns and "UX2" in raw.columns:
+            ts = (raw["UX2"] - raw["UX1"]) / raw["UX1"] * 100
+            ts_mean = ts.expanding(min_periods=21).mean()
+            ts_std = ts.expanding(min_periods=21).std()
+            features["HMM_TS_Slope_Std"] = (ts - ts_mean) / ts_std
+
+        missing = [c for c in feature_cols if c not in features.columns]
+        if missing:
+            logger.warning(
+                f"Extended history missing HMM features {missing} — skipping pre-training."
+            )
+            return None
+
+        features = features[feature_cols].dropna()
+
+        if len(features) < 252:
+            logger.warning(
+                f"Extended history too short ({len(features)} rows) — skipping pre-training."
+            )
+            return None
+
+        logger.info(
+            f"Extended history: {len(features)} days for pre-training "
+            f"({features.index.min().date()} → {features.index.max().date()})"
+        )
+        return features.values
+
     @staticmethod
     def _confirm_regimes(
         raw_regimes: np.ndarray,

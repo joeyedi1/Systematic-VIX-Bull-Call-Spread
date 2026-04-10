@@ -16,6 +16,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+import calendar
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -351,6 +353,322 @@ class BloombergDataPipeline:
         
         return raw_df
     
+    def fetch_extended_history(
+        self,
+        start_date: str = "20100101",
+        end_date: str = "20211231",
+        cache_file: str = "vix_extended_history_2010_2021.parquet",
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Fetch 12-year VIX history (2010-2021) for HMM pre-training.
+
+        Tickers pulled (BDH daily, PX_LAST):
+            VIX Index, VIX3M Index (VXV fallback for pre-2018),
+            VIX9D Index (~2016+), VVIX Index (~2012+),
+            UX1/UX2/UX3 Index, SPX Index.
+
+        Missing-data handling:
+          - VIX9D: available from ~2016, NaN-filled before.
+          - VVIX:  available from ~2012, NaN-filled before.
+          - VIX3M: Bloomberg back-fills VXV history under VIX3M Index;
+                   falls back to VXV Index if VIX3M returns empty.
+
+        Saves to: outputs/cache/<cache_file>
+        """
+        cache_path = self.CACHE_DIR / cache_file
+
+        if not force_refresh and cache_path.exists():
+            logger.info(f"Loading extended history cache: {cache_path}")
+            return pd.read_parquet(cache_path)
+
+        self.bbg = BloombergSession()
+        self.bbg.connect()
+
+        try:
+            df = self._fetch_extended_and_merge(start_date, end_date)
+            df.to_parquet(cache_path)
+            logger.info(
+                f"Extended history saved: {cache_path} "
+                f"({len(df)} rows, {df.index.min().date()} – {df.index.max().date()})"
+            )
+            return df
+        finally:
+            self.bbg.close()
+
+    def _fetch_extended_and_merge(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Fetch all extended-history tickers and merge into one DataFrame."""
+
+        # 1. Core tickers — available for the full 2010-2021 window
+        core_map = {
+            "VIX_Spot":  "VIX Index",
+            "UX1":       "UX1 Index",
+            "UX2":       "UX2 Index",
+            "UX3":       "UX3 Index",
+            "SPX_Close": "SPX Index",
+        }
+        logger.info("Extended history — fetching core tickers (VIX, UX1-3, SPX)...")
+        core_raw = self._fetch_historical(
+            list(core_map.values()), ["PX_LAST"], start_date, end_date
+        )
+        result = self._pivot_single_field(core_raw, core_map)
+
+        # 2. VIX3M — Bloomberg back-fills VXV as VIX3M Index; fall back to VXV if empty
+        logger.info("Extended history — fetching VIX3M (VXV fallback if needed)...")
+        vix3m_raw = self._fetch_historical(
+            ["VIX3M Index"], ["PX_LAST"], start_date, end_date
+        )
+        if not vix3m_raw.empty:
+            vix3m_wide = self._pivot_single_field(vix3m_raw, {"VIX3M": "VIX3M Index"})
+        else:
+            logger.info("  VIX3M Index returned empty — retrying with VXV Index...")
+            vxv_raw = self._fetch_historical(
+                ["VXV Index"], ["PX_LAST"], start_date, end_date
+            )
+            vix3m_wide = (
+                self._pivot_single_field(vxv_raw, {"VIX3M": "VXV Index"})
+                if not vxv_raw.empty
+                else pd.DataFrame()
+            )
+        if not vix3m_wide.empty:
+            result = result.join(vix3m_wide, how="left")
+        else:
+            logger.warning("  VIX3M/VXV both unavailable — column will be NaN")
+            result["VIX3M"] = np.nan
+
+        # 3. Optional tickers — graceful NaN fill when unavailable for early dates
+        optional_map = {
+            "VIX9D": "VIX9D Index",  # Available from ~2016; NaN before
+            "VVIX":  "VVIX Index",   # Available from ~2012; NaN before
+        }
+        for col, ticker in optional_map.items():
+            logger.info(f"Extended history — fetching {col} ({ticker})...")
+            opt_raw = self._fetch_historical([ticker], ["PX_LAST"], start_date, end_date)
+            if not opt_raw.empty:
+                opt_wide = self._pivot_single_field(opt_raw, {col: ticker})
+                if not opt_wide.empty:
+                    result = result.join(opt_wide, how="left")
+                    non_null = int(opt_wide[col].notna().sum()) if col in opt_wide.columns else 0
+                    logger.info(f"  {col}: {non_null} non-null rows")
+                else:
+                    result[col] = np.nan
+            else:
+                logger.info(f"  {col}: no data returned — filling with NaN")
+                result[col] = np.nan
+
+        # 4. Forward-fill small gaps (weekends / holidays already handled by Bloomberg)
+        result = result.ffill(limit=3)
+
+        # 5. Drop rows where VIX_Spot is missing (non-trading days)
+        result = result.dropna(subset=["VIX_Spot"])
+
+        logger.info(
+            f"Extended history: {len(result)} rows, {len(result.columns)} cols | "
+            f"{result.index.min().date()} → {result.index.max().date()}"
+        )
+        return result
+
+    def fetch_option_chains(
+        self,
+        start_expiry: str = "2023-01",
+        end_expiry: str = "2026-03",
+        strikes: Optional[List[int]] = None,
+        days_before_expiry: int = 60,
+        output_dir: str = "outputs/cache/vix_option_chains",
+        batch_delay_seconds: float = 0.5,
+        test_mode_n: int = 0,
+    ) -> List[str]:
+        """
+        Fetch daily VIX call option NBBO for every monthly expiry in range.
+
+        For each expiry pulls PX_BID / PX_ASK / PX_LAST for calls at
+        strikes 10-35, covering the 60 calendar days before expiry.
+
+        Output: one parquet per expiry in output_dir:
+            vix_options_YYYY_MM.parquet
+        Columns: C{K}_Bid, C{K}_Ask, C{K}_Mid, C{K}_Last  (K = 10..35).
+        Existing files are skipped (idempotent).
+
+        Args:
+            start_expiry:         First expiry month as "YYYY-MM".
+            end_expiry:           Last  expiry month as "YYYY-MM".
+            strikes:              Integer strikes to pull (default 10-35).
+            days_before_expiry:   Calendar-day look-back per expiry (default 60).
+            batch_delay_seconds:  Sleep between expiry requests (rate-limit guard).
+            test_mode_n:          If > 0, stop after this many expiries.
+
+        Returns:
+            List of parquet file paths written (skipped files excluded).
+        """
+        if strikes is None:
+            strikes = list(range(10, 36))   # C10 … C35
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        sy, sm = int(start_expiry[:4]), int(start_expiry[5:7])
+        ey, em = int(end_expiry[:4]),   int(end_expiry[5:7])
+        expiries = self._generate_expiry_dates_in_range(sy, sm, ey, em)
+
+        if test_mode_n > 0:
+            expiries = expiries[:test_mode_n]
+            logger.info(f"TEST MODE: fetching {test_mode_n} of {len(expiries)} expiries")
+
+        logger.info(
+            f"Option chain fetch: {len(expiries)} expiries × {len(strikes)} strikes "
+            f"(C{strikes[0]}–C{strikes[-1]})"
+        )
+
+        self.bbg = BloombergSession()
+        self.bbg.connect()
+
+        written: List[str] = []
+        try:
+            for i, exp_dt in enumerate(expiries):
+                tag   = f"{exp_dt.year:04d}_{exp_dt.month:02d}"
+                fname = f"vix_options_{tag}.parquet"
+                fpath = out_dir / fname
+
+                if fpath.exists():
+                    logger.info(f"  [{i+1}/{len(expiries)}] {exp_dt.date()} — cached, skip")
+                    continue
+
+                start_dt  = exp_dt - timedelta(days=days_before_expiry)
+                bbg_expiry = exp_dt.strftime("%m/%d/%y")   # Bloomberg: MM/DD/YY
+                start_str  = start_dt.strftime("%Y%m%d")
+                end_str    = exp_dt.strftime("%Y%m%d")
+
+                logger.info(
+                    f"  [{i+1}/{len(expiries)}] {exp_dt.date()} ({bbg_expiry}) "
+                    f"| {start_str}–{end_str} | {len(strikes)} strikes"
+                )
+
+                try:
+                    df = self._fetch_one_expiry_chain(
+                        bbg_expiry, strikes, start_str, end_str
+                    )
+                    if df.empty:
+                        logger.warning(f"    No data returned for {exp_dt.date()}")
+                    else:
+                        df.to_parquet(fpath)
+                        logger.info(
+                            f"    Saved {fname}: {len(df)} rows × {len(df.columns)} cols"
+                        )
+                        written.append(str(fpath))
+                except Exception as exc:
+                    logger.error(f"    Fetch failed for {exp_dt.date()}: {exc}")
+
+                if batch_delay_seconds > 0 and i < len(expiries) - 1:
+                    time.sleep(batch_delay_seconds)
+
+        finally:
+            self.bbg.close()
+
+        logger.info(f"Option chain fetch complete: {len(written)} new files in {out_dir}")
+        return written
+
+    def _fetch_one_expiry_chain(
+        self,
+        bbg_expiry: str,    # "MM/DD/YY"
+        strikes: List[int],
+        start_date: str,    # "YYYYMMDD"
+        end_date: str,
+    ) -> pd.DataFrame:
+        """
+        Fetch all strikes for one expiry and return wide-format DataFrame.
+        Columns: C{K}_Bid, C{K}_Ask, C{K}_Mid, C{K}_Last.
+        Missing / illiquid strikes produce NaN columns — no error raised.
+        """
+        ticker_map: Dict[str, str] = {
+            f"C{k}": f"VIX US {bbg_expiry} C{k} Index"
+            for k in strikes
+        }
+
+        raw = self._fetch_historical(
+            list(ticker_map.values()),
+            ["PX_BID", "PX_ASK", "PX_LAST"],
+            start_date,
+            end_date,
+        )
+
+        if raw.empty:
+            return pd.DataFrame()
+
+        # Build wide format: one series per (strike, field)
+        series_dict: Dict[str, pd.Series] = {}
+        for label, ticker in ticker_map.items():
+            sub = raw[raw["Ticker"] == ticker].copy()
+            if sub.empty:
+                continue
+            sub = sub.set_index("Date").sort_index()
+            for field, suffix in [("PX_BID", "Bid"), ("PX_ASK", "Ask"), ("PX_LAST", "Last")]:
+                if field in sub.columns:
+                    series_dict[f"{label}_{suffix}"] = sub[field]
+
+        if not series_dict:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(series_dict)
+        result.index = pd.to_datetime(result.index)
+        result = result.sort_index()
+
+        # Compute mid = (Bid + Ask) / 2; fill any gaps from PX_LAST
+        for k in strikes:
+            bid  = result.get(f"C{k}_Bid")
+            ask  = result.get(f"C{k}_Ask")
+            last = result.get(f"C{k}_Last")
+
+            if bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+                if last is not None:
+                    mid = mid.fillna(last)
+            elif last is not None:
+                mid = last.copy()
+            else:
+                continue   # No price data for this strike
+
+            result[f"C{k}_Mid"] = mid
+
+        # Canonical column order: C10_Bid, C10_Ask, C10_Mid, C10_Last, C11_Bid …
+        ordered = [
+            f"C{k}_{suf}"
+            for k in strikes
+            for suf in ("Bid", "Ask", "Mid", "Last")
+            if f"C{k}_{suf}" in result.columns
+        ]
+        return result[ordered]
+
+    @staticmethod
+    def _generate_expiry_dates_in_range(
+        start_year: int, start_month: int,
+        end_year: int,   end_month: int,
+    ) -> List[datetime]:
+        """
+        Generate VIX monthly expiry dates (inclusive) from start to end.
+
+        CBOE rule: VIX expiry = 3rd Friday of the FOLLOWING calendar month
+        minus 30 calendar days.  This always lands on a Wednesday.
+        """
+        expiries: List[datetime] = []
+        y, m = start_year, start_month
+
+        while (y < end_year) or (y == end_year and m <= end_month):
+            next_m = m + 1 if m < 12 else 1
+            next_y = y     if m < 12 else y + 1
+
+            month_cal = calendar.monthcalendar(next_y, next_m)
+            fridays   = [week[calendar.FRIDAY] for week in month_cal
+                         if week[calendar.FRIDAY] != 0]
+            third_fri = datetime(next_y, next_m, fridays[2])
+            expiries.append(third_fri - timedelta(days=30))
+
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
+
+        return expiries
+
     def close(self):
         """Clean up Bloomberg connection."""
         if self.bbg:

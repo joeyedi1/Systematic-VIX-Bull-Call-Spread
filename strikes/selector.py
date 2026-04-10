@@ -95,9 +95,13 @@ class StrikeSelector:
             logger.info(f"DTE {dte} outside window [{dte_min}, {dte_max}]")
             return None
         
-        # Scale-normalized spread width (v1.3): percentage of VIX futures, clamped
-        raw_width = round(vix_futures * self.config.spread_width_pct)
-        spread_width = max(self.config.min_spread_width, min(self.config.max_spread_width, raw_width))
+        # Spread width: fixed override when set, otherwise dynamic % of futures
+        override = getattr(self.config, 'spread_width_override', None)
+        if override is not None:
+            spread_width = int(override)
+        else:
+            raw_width = round(vix_futures * self.config.spread_width_pct)
+            spread_width = max(self.config.min_spread_width, min(self.config.max_spread_width, raw_width))
         
         if spread_width == 0:
             return None

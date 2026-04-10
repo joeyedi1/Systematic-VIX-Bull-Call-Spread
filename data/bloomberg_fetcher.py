@@ -473,29 +473,31 @@ class BloombergDataPipeline:
         start_expiry: str = "2023-01",
         end_expiry: str = "2026-03",
         strikes: Optional[List[int]] = None,
-        days_before_expiry: int = 60,
+        days_before_expiry: int = 80,
         output_dir: str = "outputs/cache/vix_option_chains",
         batch_delay_seconds: float = 0.5,
         test_mode_n: int = 0,
+        force_refresh: bool = False,
     ) -> List[str]:
         """
         Fetch daily VIX call option NBBO for every monthly expiry in range.
 
         For each expiry pulls PX_BID / PX_ASK / PX_LAST for calls at
-        strikes 10-35, covering the 60 calendar days before expiry.
+        strikes 10-35, covering the 80 calendar days before expiry.
 
         Output: one parquet per expiry in output_dir:
             vix_options_YYYY_MM.parquet
         Columns: C{K}_Bid, C{K}_Ask, C{K}_Mid, C{K}_Last  (K = 10..35).
-        Existing files are skipped (idempotent).
+        Existing files are skipped unless force_refresh=True.
 
         Args:
             start_expiry:         First expiry month as "YYYY-MM".
             end_expiry:           Last  expiry month as "YYYY-MM".
             strikes:              Integer strikes to pull (default 10-35).
-            days_before_expiry:   Calendar-day look-back per expiry (default 60).
+            days_before_expiry:   Calendar-day look-back per expiry (default 80).
             batch_delay_seconds:  Sleep between expiry requests (rate-limit guard).
             test_mode_n:          If > 0, stop after this many expiries.
+            force_refresh:        If True, delete existing files and re-pull.
 
         Returns:
             List of parquet file paths written (skipped files excluded).
@@ -530,8 +532,12 @@ class BloombergDataPipeline:
                 fpath = out_dir / fname
 
                 if fpath.exists():
-                    logger.info(f"  [{i+1}/{len(expiries)}] {exp_dt.date()} — cached, skip")
-                    continue
+                    if force_refresh:
+                        fpath.unlink()
+                        logger.info(f"  [{i+1}/{len(expiries)}] {exp_dt.date()} — deleted for refresh")
+                    else:
+                        logger.info(f"  [{i+1}/{len(expiries)}] {exp_dt.date()} — cached, skip")
+                        continue
 
                 start_dt  = exp_dt - timedelta(days=days_before_expiry)
                 bbg_expiry = exp_dt.strftime("%m/%d/%y")   # Bloomberg: MM/DD/YY

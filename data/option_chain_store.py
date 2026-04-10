@@ -200,10 +200,22 @@ class OptionChainStore:
         row = self._get_row(expiry_date, obs_date)
         if row is None:
             return None
-        val = row.get(f"C{strike}_Mid", np.nan)
-        if pd.isna(val) or float(val) <= 0:
+        bid_val = row.get(f"C{strike}_Bid", np.nan)
+        ask_val = row.get(f"C{strike}_Ask", np.nan)
+        mid_val = row.get(f"C{strike}_Mid", np.nan)
+        if pd.isna(mid_val) or float(mid_val) <= 0:
             return None
-        return float(val)
+        mid = float(mid_val)
+        # Sanity check: reject if ask is pathologically wide relative to bid
+        # (stale/stuck Bloomberg quote — e.g. Feb 27 2024: bid=1.54, ask=25.00 → mid=13.27)
+        if not pd.isna(bid_val) and not pd.isna(ask_val):
+            bid, ask = float(bid_val), float(ask_val)
+            if bid > 0 and ask > 0:
+                if ask > bid * 6:   # ask > 6x bid signals stale data
+                    return None
+                if not (bid - 0.01 <= mid <= ask + 0.01):
+                    return None
+        return mid
 
     # ------------------------------------------------------------------
     # Internal helpers
